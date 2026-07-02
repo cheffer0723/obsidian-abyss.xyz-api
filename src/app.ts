@@ -38,12 +38,17 @@ app.use(express.urlencoded({ extended: true }));
 
 // Agentic access (x402): gates only MACHINE_ROUTE_PATH when X402_ENABLED=true.
 // Off/unconfigured => middleware is null and the route stays free. Human endpoints are never gated.
-const x402Middleware = createX402Middleware();
+let x402Middleware: ReturnType<typeof createX402Middleware> = null;
+try {
+  x402Middleware = createX402Middleware();
+} catch (err) {
+  logger.error({ err }, "x402 init failed - continuing without agentic access");
+}
 if (x402Middleware) {
   app.use(x402Middleware);
   logger.info({ route: MACHINE_ROUTE_PATH }, "x402 agentic access ENABLED");
 } else {
-  logger.info("x402 agentic access disabled (X402_ENABLED!=true or unconfigured)");
+  logger.info("x402 agentic access off (disabled, unconfigured, or facilitator unavailable)");
 }
 
 app.use("/api", router);
