@@ -23,10 +23,14 @@ const x402 = JSON.parse(status.body).status;
 assert.equal(x402.enabled, true, "x402 must be enabled before checking the paid route");
 assert.equal(x402.protocol, "x402", "Machine route must advertise x402");
 
+const billing = await request("/billing/status");
+assert.equal(billing.response.status, 200, `Billing status failed: ${billing.body}`);
+assert.equal(JSON.parse(billing.body).ok, true, "Billing status must return ok");
+
 const challenges = await Promise.all(Array.from({ length: attempts }, () => request("/machine/backtesting")));
 for (const challenge of challenges) {
   assert.equal(challenge.response.status, 402, "Unpaid machine request must return 402");
   assert.ok(challenge.response.headers.get("payment-required"), "402 response must include payment-required metadata");
 }
 
-console.log(JSON.stringify({ ok: true, apiBase, x402Attempts: attempts, checks: ["health", "engine-data", "x402-status", "402-challenge"] }));
+console.log(JSON.stringify({ ok: true, apiBase, x402Attempts: attempts, checks: ["health", "engine-data", "billing-status", "x402-status", "402-challenge"] }));

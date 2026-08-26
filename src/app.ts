@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
 import { createX402Middleware, MACHINE_ROUTE_PATH } from "./lib/x402.js";
+import { stripeWebhookHandler } from "./lib/billing.js";
 
 const app: Express = express();
 const createPinoHttp = pinoHttp as unknown as (options: any) => express.RequestHandler;
@@ -32,6 +33,8 @@ app.use(
 );
 app.disable("x-powered-by");
 app.use(cors());
+// Stripe requires the untouched raw request body for signed webhook verification.
+app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "5mb" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
