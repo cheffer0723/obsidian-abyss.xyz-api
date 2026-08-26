@@ -1,0 +1,26 @@
+name: Production API smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: "Public API base URL (including /api)"
+        required: false
+        default: "https://webapp-backend-production-7f0f.up.railway.app/api"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Verify public API and unpaid x402 challenge
+        env:
+          API_BASE: ${{ inputs.api_base }}
+          X402_ATTEMPTS: "6"
+        run: node scripts/smoke.mjs

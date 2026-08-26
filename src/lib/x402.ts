@@ -95,7 +95,7 @@ export function createX402Middleware(): RequestHandler | null {
     ? new HTTPFacilitatorClient(cdpFacilitator)
     : new HTTPFacilitatorClient({ url: c.facilitatorUrl });
   const resourceServer = new x402ResourceServer(facilitatorClient);
-  registerExactEvmScheme(resourceServer, { networks: [c.network] });
+  registerExactEvmScheme(resourceServer, { networks: [c.network as `${string}:${string}`] });
 
   return paymentMiddleware(routes as any, resourceServer) as unknown as RequestHandler;
 }
