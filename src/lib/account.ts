@@ -37,7 +37,11 @@ export async function requestMagicLink(emailInput: string): Promise<void> {
     return;
   }
   const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === "true", auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
-  await transporter.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to: email, subject: "Your Obsidian Abyss sign-in link", text: `Enter the Abyss: ${link}\n\nThis link expires in 20 minutes and can be used once.` });
+  try {
+    await transporter.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to: email, subject: "Your Obsidian Abyss sign-in link", text: `Enter the Abyss: ${link}\n\nThis link expires in 20 minutes and can be used once.` });
+  } catch (error) {
+    logger.warn({ emailDomain: email.split("@")[1], error: error instanceof Error ? error.name : "unknown" }, "Magic link delivery failed");
+  }
 }
 
 export async function verifyMagicLink(token: string, res: Response): Promise<boolean> {
