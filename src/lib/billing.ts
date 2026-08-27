@@ -1,6 +1,7 @@
 import Stripe from "stripe";
 import type { RequestHandler } from "express";
 import { logger } from "./logger.js";
+import { bindStripeCustomer, currentUser, upsertEntitlement } from "./account.js";
 
 type BillingConfig = {
   secretKey: string;
@@ -60,8 +61,10 @@ export function getBillingStatus() {
   };
 }
 
-export async function createCheckoutSession(): Promise<{ url: string }> {
+export async function createCheckoutSession(req: Parameters<RequestHandler>[0]): Promise<{ url: string }> {
   const config = billingConfig();
+  const user = await currentUser(req);
+  if (!user) throw new Error("Authentication is required before checkout.");
   const client = stripe(config);
   const price = await client.prices.retrieve(config.priceId);
   if (
@@ -79,14 +82,16 @@ export async function createCheckoutSession(): Promise<{ url: string }> {
     success_url: config.successUrl,
     cancel_url: config.cancelUrl,
     allow_promotion_codes: true,
-    subscription_data: { metadata: { product: "obsidian-abyss", fulfilment: "manual-pending" } },
-    metadata: { product: "obsidian-abyss", fulfilment: "manual-pending" },
+    customer_email: user.email,
+    subscription_data: { metadata: { product: "obsidian-abyss", user_id: user.id } },
+    metadata: { product: "obsidian-abyss", user_id: user.id },
   });
+  if (typeof session.customer === "string") await bindStripeCustomer(user.id, session.customer);
   if (!session.url) throw new Error("Stripe did not return a Checkout URL.");
   return { url: session.url };
 }
 
-export const stripeWebhookHandler: RequestHandler = (req, res) => {
+export const stripeWebhookHandler: RequestHandler = async (req, res) => {
   try {
     const config = billingConfig();
     if (!config.webhookSecret) {
@@ -99,6 +104,12 @@ export const stripeWebhookHandler: RequestHandler = (req, res) => {
       return;
     }
     const event = stripe(config).webhooks.constructEvent(req.body, signature, config.webhookSecret);
+    const object = event.data.object as Record<string, any>;
+    if (event.type === "checkout.session.completed" && typeof object.customer === "string" && typeof object.metadata?.user_id === "string") await bindStripeCustomer(object.metadata.user_id, object.customer);
+    if (["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"].includes(event.type) && typeof object.customer === "string") {
+      if (typeof object.metadata?.user_id === "string") await bindStripeCustomer(object.metadata.user_id, object.customer);
+      await upsertEntitlement(object.customer, object.id, object.status || (event.type.endsWith("deleted") ? "canceled" : "unknown"), object.current_period_end || null);
+    }
     logger.info(
       { stripeEventType: event.type, stripeEventId: event.id, livemode: event.livemode },
       "Verified Stripe webhook; entitlement fulfilment remains manual",

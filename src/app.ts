@@ -1,5 +1,6 @@
 import express, { type Express } from "express";
 import cors from "cors";
+import cookieParser from "cookie-parser";
 import pinoHttp from "pino-http";
 import fs from "fs";
 import path from "path";
@@ -8,6 +9,7 @@ import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
 import { createX402Middleware, MACHINE_ROUTE_PATH } from "./lib/x402.js";
 import { stripeWebhookHandler } from "./lib/billing.js";
+import authRouter from "./routes/auth.js";
 
 const app: Express = express();
 const createPinoHttp = pinoHttp as unknown as (options: any) => express.RequestHandler;
@@ -32,12 +34,15 @@ app.use(
   }),
 );
 app.disable("x-powered-by");
-app.use(cors());
+const allowedOrigins = new Set(["https://obsidian-abyss.xyz", "https://www.obsidian-abyss.xyz", ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)]);
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)), credentials: true }));
+app.use(cookieParser());
 // Stripe requires the untouched raw request body for signed webhook verification.
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "5mb" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use("/api", authRouter);
 
 // Agentic access (x402): gates only MACHINE_ROUTE_PATH when X402_ENABLED=true.
 // Off/unconfigured => middleware is null and the route stays free. Human endpoints are never gated.
