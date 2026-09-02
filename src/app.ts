@@ -40,7 +40,7 @@ app.use(cookieParser());
 // Stripe requires the untouched raw request body for signed webhook verification.
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "5mb" }));
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use("/api", authRouter);
 
@@ -85,7 +85,10 @@ app.use((_req, res) => {
 app.use(
   (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);
-    res.status(500).json({ ok: false, error: "Internal server error" });
+    const statusCode = err && typeof err === "object" && "statusCode" in err && Number.isInteger(Number(err.statusCode))
+      ? Number(err.statusCode)
+      : 500;
+    res.status(statusCode).json({ ok: false, error: statusCode === 500 ? "Internal server error" : String((err as Error).message) });
   },
 );
 
