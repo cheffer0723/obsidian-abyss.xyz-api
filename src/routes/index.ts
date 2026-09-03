@@ -6,6 +6,7 @@ import hexagonRouter from "./hexagon.js";
 import backtestsRouter from "./backtests.js";
 import billingRouter from "./billing.js";
 import testingHarnessRouter from "./testing-harness.js";
+import adminRouter from "./admin.js";
 
 const router = Router();
 
@@ -16,5 +17,6 @@ router.use(hexagonRouter);
 router.use(backtestsRouter);
 router.use(billingRouter);
 router.use(testingHarnessRouter);
+router.use(adminRouter);
 
 export default router;

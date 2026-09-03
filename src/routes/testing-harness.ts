@@ -4,6 +4,7 @@ import { evaluateFrozenEngines, type HistoricalClose, type MarketKind } from "..
 import { CLOSED_TRADE_CSV_HEADER, parseClosedTradesCsv, replayClosedTrades, type ClosedTradeInput } from "../lib/trade-replay.js";
 import { requireActiveSubscription } from "../lib/access.js";
 import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore } from "../lib/testing-market-history.js";
+import { recordMetricEvent } from "../lib/account.js";
 
 const router = Router();
 
@@ -31,6 +32,7 @@ router.post("/testing-harness/engines/evaluate", requireActiveSubscription, (req
 });
 
 router.post("/testing-harness/replay", requireActiveSubscription, (req, res, next) => {
+  const startedAt = Date.now();
   try {
     const body = req.body && typeof req.body === "object" ? req.body as { trades?: unknown; csv?: unknown } : {};
     const trades = typeof req.body === "string"
@@ -39,12 +41,31 @@ router.post("/testing-harness/replay", requireActiveSubscription, (req, res, nex
         ? parseClosedTradesCsv(body.csv)
         : body.trades as ClosedTradeInput[];
     const store = loadTestingMarketHistory();
-    res.json(replayClosedTrades(
+    const replay = replayClosedTrades(
       trades,
       historiesFromStore(store),
       marketKindsFromStore(store),
-    ));
+    );
+    void recordMetricEvent({
+      eventType: "harness_replay",
+      outcome: "success",
+      durationMs: Date.now() - startedAt,
+      tradeCount: replay.coverage.totalTrades,
+      matchedTradeCount: replay.coverage.withMarketHistory,
+      metadata: {
+        outOfRangeTrades: replay.coverage.outOfRangeMarketHistory,
+        symbolsTested: replay.coverage.symbolsTested.length,
+        engineSamples: replay.engines.map((engine) => ({ key: engine.key, eligibleTrades: engine.eligibleTrades, longContextTrades: engine.longContextTrades })),
+      },
+    });
+    res.json(replay);
   } catch (error) {
+    void recordMetricEvent({
+      eventType: "harness_replay",
+      outcome: "rejected",
+      durationMs: Date.now() - startedAt,
+      metadata: { reason: error && typeof error === "object" && "statusCode" in error && Number((error as { statusCode?: unknown }).statusCode) === 400 ? "validation" : "service" },
+    });
     next(error);
   }
 });

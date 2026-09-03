@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import type { RequestHandler } from "express";
 import { logger } from "./logger.js";
-import { bindStripeCustomer, currentUser, upsertEntitlement } from "./account.js";
+import { bindStripeCustomer, currentUser, recordMetricEvent, upsertEntitlement } from "./account.js";
 
 type BillingConfig = {
   secretKey: string;
@@ -88,6 +88,7 @@ export async function createCheckoutSession(req: Parameters<RequestHandler>[0]):
   });
   if (typeof session.customer === "string") await bindStripeCustomer(user.id, session.customer);
   if (!session.url) throw new Error("Stripe did not return a Checkout URL.");
+  void recordMetricEvent({ eventType: "checkout_created", outcome: "success" });
   return { url: session.url };
 }
 
@@ -114,9 +115,15 @@ export const stripeWebhookHandler: RequestHandler = async (req, res) => {
       { stripeEventType: event.type, stripeEventId: event.id, livemode: event.livemode },
       "Verified Stripe webhook; entitlement fulfilment remains manual",
     );
+    void recordMetricEvent({
+      eventType: "billing_webhook",
+      outcome: "success",
+      metadata: { eventType: event.type, mode: event.livemode ? "live" : "test" },
+    });
     res.json({ received: true });
   } catch (error) {
     logger.warn({ stripeWebhookError: error instanceof Error ? error.message : "unknown" }, "Stripe webhook signature verification failed");
+    void recordMetricEvent({ eventType: "billing_webhook", outcome: "failed" });
     res.status(400).json({ ok: false, error: "Invalid Stripe webhook signature." });
   }
 };

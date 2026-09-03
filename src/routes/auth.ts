@@ -3,7 +3,7 @@ import { z } from "zod";
 import { currentUser, entitlementFor, requestMagicLink, verifyMagicLink, databaseReady, isAdminEmail } from "../lib/account.js";
 
 const router = Router();
-const returnToSchema = z.enum(["/", "/demo", "/pricing"]);
+const returnToSchema = z.enum(["/", "/demo", "/pricing", "/admin"]);
 const emailSchema = z.object({ email: z.string().trim().email().max(320), returnTo: returnToSchema.optional().default("/") });
 
 router.post("/auth/request-link", async (req, res, next) => { try { if (!databaseReady()) return res.status(503).json({ ok: false, error: "Authentication is temporarily unavailable." }); const { email, returnTo } = emailSchema.parse(req.body); await requestMagicLink(email, returnTo); res.json({ ok: true, message: "If that address is eligible, a sign-in link is on its way." }); } catch (e) { next(e); } });

@@ -39,3 +39,25 @@ export function createRequireActiveSubscription(dependencies: AccessDependencies
 }
 
 export const requireActiveSubscription = createRequireActiveSubscription({ databaseReady, currentUser, entitlementFor, isAdminEmail });
+
+export const requireAdmin: RequestHandler = async (req, res, next) => {
+  try {
+    if (!databaseReady()) {
+      res.status(503).json({ ok: false, error: "Administrator access is temporarily unavailable." });
+      return;
+    }
+    const user = await currentUser(req);
+    if (!user) {
+      res.status(401).json({ ok: false, error: "Sign-in is required." });
+      return;
+    }
+    if (!isAdminEmail(user.email)) {
+      res.status(403).json({ ok: false, error: "Administrator access is required." });
+      return;
+    }
+    res.locals.user = { id: user.id, email: user.email, admin: true };
+    next();
+  } catch (error) {
+    next(error);
+  }
+};

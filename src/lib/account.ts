@@ -16,6 +16,18 @@ async function ensureSchema(): Promise<void> {
     CREATE TABLE IF NOT EXISTS abyss_auth_tokens (token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL, used_at timestamptz);
     CREATE TABLE IF NOT EXISTS abyss_sessions (token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS abyss_entitlements (user_id uuid PRIMARY KEY REFERENCES abyss_users(id) ON DELETE CASCADE, stripe_subscription_id text UNIQUE NOT NULL, status text NOT NULL, current_period_end timestamptz, updated_at timestamptz NOT NULL DEFAULT now());
+    CREATE TABLE IF NOT EXISTS abyss_metric_events (
+      id bigserial PRIMARY KEY,
+      occurred_at timestamptz NOT NULL DEFAULT now(),
+      event_type text NOT NULL,
+      outcome text NOT NULL,
+      duration_ms integer,
+      trade_count integer,
+      matched_trade_count integer,
+      metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
   `).then(() => undefined);
   await schemaReady;
 }
@@ -39,6 +51,7 @@ export async function requestMagicLink(emailInput: string, returnTo = "/"): Prom
   const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
   const token = randomToken();
   await pool!.query(`INSERT INTO abyss_auth_tokens (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '20 minutes')`, [hash(token), user.rows[0].id]);
+  void recordMetricEvent({ eventType: "magic_link_requested", outcome: "accepted" });
   const apiUrl = (process.env.AUTH_API_URL || "https://webapp-backend-production-7f0f.up.railway.app/api").replace(/\/$/, "");
   const link = `${apiUrl}/auth/verify?token=${encodeURIComponent(token)}&returnTo=${encodeURIComponent(returnTo)}`;
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
@@ -59,6 +72,7 @@ export async function verifyMagicLink(token: string, res: Response): Promise<boo
   const result = await pool!.query<{ user_id: string }>(`UPDATE abyss_auth_tokens SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() RETURNING user_id`, [hash(token)]);
   if (!result.rowCount) return false;
   await pool!.query(`INSERT INTO abyss_sessions (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '30 days')`, [hash(session), result.rows[0].user_id]);
+  void recordMetricEvent({ eventType: "magic_link_verified", outcome: "success" });
   // The Pages frontend and Railway API are different sites; Secure + None is
   // required for the browser to send this HttpOnly session cookie cross-site.
   res.cookie("abyss_session", session, { httpOnly: true, secure: true, sameSite: "none", maxAge: 30 * 24 * 60 * 60 * 1000 });
@@ -82,3 +96,154 @@ export async function upsertEntitlement(stripeCustomerId: string, subscriptionId
 
 export async function bindStripeCustomer(userId: string, customerId: string): Promise<void> { await ensureSchema(); await pool!.query(`UPDATE abyss_users SET stripe_customer_id=$1 WHERE id=$2`, [customerId, userId]); }
 export async function entitlementFor(userId: string): Promise<{ active: boolean; status: string | null }> { await ensureSchema(); const r = await pool!.query<{ status: string }>(`SELECT status FROM abyss_entitlements WHERE user_id=$1`, [userId]); return { active: ["active", "trialing", "past_due"].includes(r.rows[0]?.status || ""), status: r.rows[0]?.status || null }; }
+
+export type MetricEvent = {
+  eventType: "magic_link_requested" | "magic_link_verified" | "checkout_created" | "billing_webhook" | "harness_replay";
+  outcome: "accepted" | "success" | "failed" | "rejected";
+  durationMs?: number;
+  tradeCount?: number;
+  matchedTradeCount?: number;
+  metadata?: Record<string, unknown>;
+};
+
+/**
+ * Product telemetry is deliberately aggregate-only. Do not place email addresses,
+ * user ids, CSV text, trade rows, payment ids, or secrets in metadata.
+ */
+export async function recordMetricEvent(event: MetricEvent): Promise<void> {
+  if (!pool) return;
+  try {
+    await ensureSchema();
+    await pool.query(
+      `INSERT INTO abyss_metric_events (event_type,outcome,duration_ms,trade_count,matched_trade_count,metadata)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+      [
+        event.eventType,
+        event.outcome,
+        finitePositiveInteger(event.durationMs),
+        finitePositiveInteger(event.tradeCount),
+        finitePositiveInteger(event.matchedTradeCount),
+        JSON.stringify(event.metadata || {}),
+      ],
+    );
+  } catch (error) {
+    logger.warn({ metricEvent: event.eventType, metricError: error instanceof Error ? error.name : "unknown" }, "Metric event was not stored");
+  }
+}
+
+export type AdminMetricEvent = {
+  eventType: string;
+  outcome: string;
+  occurredAt: string;
+  durationMs: number | null;
+  tradeCount: number | null;
+  matchedTradeCount: number | null;
+};
+
+export type AdminOverview = {
+  generatedAt: string;
+  windowDays: number;
+  accounts: { total: number; createdInWindow: number; activeAccess: number };
+  access: { linksRequested: number; linksVerified: number };
+  billing: { checkoutCreated: number; webhookProcessed: number; webhookFailed: number };
+  harness: {
+    replayCompleted: number;
+    replayFailed: number;
+    acceptedRatePct: number | null;
+    dataCoveragePct: number | null;
+    medianReplayMs: number | null;
+    tradesTested: number;
+    matchedTrades: number;
+  };
+  engines: Array<{ key: string; eligibleTrades: number; longContextTrades: number }>;
+  events: AdminMetricEvent[];
+};
+
+export async function getAdminOverview(windowDays: 7 | 30): Promise<AdminOverview> {
+  await ensureSchema();
+  const [accounts, eventRows, engines, events] = await Promise.all([
+    pool!.query<{ total: string; created_in_window: string; active_access: string }>(
+      `SELECT
+        count(*)::text AS total,
+        count(*) FILTER (WHERE created_at >= now() - ($1 * interval '1 day'))::text AS created_in_window,
+        (SELECT count(*) FROM abyss_entitlements WHERE status IN ('active','trialing','past_due'))::text AS active_access
+       FROM abyss_users`,
+      [windowDays],
+    ),
+    pool!.query<{ event_type: string; outcome: string; count: string; trades: string; matched: string; median_ms: number | null }>(
+      `SELECT event_type, outcome, count(*)::text AS count,
+        coalesce(sum(trade_count), 0)::text AS trades,
+        coalesce(sum(matched_trade_count), 0)::text AS matched,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS median_ms
+       FROM abyss_metric_events
+       WHERE occurred_at >= now() - ($1 * interval '1 day')
+       GROUP BY event_type, outcome`,
+      [windowDays],
+    ),
+    pool!.query<{ key: string; eligible_trades: string; long_context_trades: string }>(
+      `SELECT sample->>'key' AS key,
+        coalesce(sum((sample->>'eligibleTrades')::integer), 0)::text AS eligible_trades,
+        coalesce(sum((sample->>'longContextTrades')::integer), 0)::text AS long_context_trades
+       FROM abyss_metric_events
+       CROSS JOIN LATERAL jsonb_array_elements(coalesce(metadata->'engineSamples', '[]'::jsonb)) AS sample
+       WHERE event_type = 'harness_replay' AND outcome = 'success'
+         AND occurred_at >= now() - ($1 * interval '1 day')
+       GROUP BY sample->>'key'
+       ORDER BY sample->>'key'`,
+      [windowDays],
+    ),
+    pool!.query<{ event_type: string; outcome: string; occurred_at: Date; duration_ms: number | null; trade_count: number | null; matched_trade_count: number | null }>(
+      `SELECT event_type, outcome, occurred_at, duration_ms, trade_count, matched_trade_count
+       FROM abyss_metric_events
+       WHERE occurred_at >= now() - ($1 * interval '1 day')
+       ORDER BY occurred_at DESC
+       LIMIT 40`,
+      [windowDays],
+    ),
+  ]);
+  const count = (eventType: string, outcome?: string) => eventRows.rows
+    .filter((row) => row.event_type === eventType && (!outcome || row.outcome === outcome))
+    .reduce((sum, row) => sum + Number(row.count), 0);
+  const replayRows = eventRows.rows.filter((row) => row.event_type === "harness_replay");
+  const replaySuccess = replayRows.filter((row) => row.outcome === "success");
+  const replayCompleted = replaySuccess.reduce((sum, row) => sum + Number(row.count), 0);
+  const replayFailed = replayRows.filter((row) => row.outcome !== "success").reduce((sum, row) => sum + Number(row.count), 0);
+  const tradesTested = replaySuccess.reduce((sum, row) => sum + Number(row.trades), 0);
+  const matchedTrades = replaySuccess.reduce((sum, row) => sum + Number(row.matched), 0);
+  const medianValues = replaySuccess.map((row) => row.median_ms).filter((value): value is number => typeof value === "number");
+  return {
+    generatedAt: new Date().toISOString(),
+    windowDays,
+    accounts: {
+      total: Number(accounts.rows[0]?.total || 0),
+      createdInWindow: Number(accounts.rows[0]?.created_in_window || 0),
+      activeAccess: Number(accounts.rows[0]?.active_access || 0),
+    },
+    access: { linksRequested: count("magic_link_requested", "accepted"), linksVerified: count("magic_link_verified", "success") },
+    billing: { checkoutCreated: count("checkout_created", "success"), webhookProcessed: count("billing_webhook", "success"), webhookFailed: count("billing_webhook", "failed") },
+    harness: {
+      replayCompleted,
+      replayFailed,
+      acceptedRatePct: replayCompleted + replayFailed ? round(replayCompleted / (replayCompleted + replayFailed) * 100, 1) : null,
+      dataCoveragePct: tradesTested ? round(matchedTrades / tradesTested * 100, 1) : null,
+      medianReplayMs: medianValues.length ? Math.round(medianValues.reduce((sum, value) => sum + value, 0) / medianValues.length) : null,
+      tradesTested,
+      matchedTrades,
+    },
+    engines: engines.rows.map((row) => ({ key: row.key, eligibleTrades: Number(row.eligible_trades), longContextTrades: Number(row.long_context_trades) })),
+    events: events.rows.map((row) => ({
+      eventType: row.event_type,
+      outcome: row.outcome,
+      occurredAt: row.occurred_at.toISOString(),
+      durationMs: row.duration_ms,
+      tradeCount: row.trade_count,
+      matchedTradeCount: row.matched_trade_count,
+    })),
+  };
+}
+
+function finitePositiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+}
+
+function round(value: number, places: number): number { return Number(value.toFixed(places)); }
