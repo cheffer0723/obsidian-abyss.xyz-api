@@ -74,7 +74,13 @@ const syntheticTrades: ClosedTradeInput[] = [
   { symbol: "DOGE-USD", side: "SHORT", entryTimestamp: replayEntry.toISOString(), exitTimestamp: replayExit.toISOString(), entryPrice: 100, exitPrice: 90, pnlUsd: 10 },
 ];
 const syntheticReplay = replayClosedTrades(syntheticTrades, { "BTC-USD": datedBars }, "eq");
-assert.deepEqual(syntheticReplay.coverage, { totalTrades: 2, withMarketHistory: 1, withoutMarketHistory: 1, symbolsTested: ["BTC-USD"], symbolsNotTested: ["DOGE-USD"] });
+assert.deepEqual(syntheticReplay.coverage, { totalTrades: 2, withMarketHistory: 1, withoutMarketHistory: 1, outOfRangeMarketHistory: 0, symbolsTested: ["BTC-USD"], symbolsNotTested: ["DOGE-USD"] });
+const staleEntry = new Date(`${datedBars.at(-1)!.date}T12:00:00Z`);
+staleEntry.setUTCDate(staleEntry.getUTCDate() + 10);
+const staleReplay = replayClosedTrades([{ ...syntheticTrades[0], entryTimestamp: staleEntry.toISOString(), exitTimestamp: new Date(staleEntry.getTime() + 60 * 60 * 1000).toISOString() }], { "BTC-USD": datedBars }, "btc");
+assert.equal(staleReplay.coverage.withMarketHistory, 0);
+assert.equal(staleReplay.coverage.outOfRangeMarketHistory, 1);
+assert.equal(staleReplay.trades[0].status, "market_history_out_of_range");
 assert.equal(syntheticReplay.trades[0].priorCloseDate, datedBars.at(-1)!.date);
 assert.equal(syntheticReplay.engines.find((engine) => engine.key === "orthrus")?.supportedUserLongs.wins, 1);
 assert.equal(syntheticReplay.engines.find((engine) => engine.key === "sisyphus")?.unsupportedUserLongs.trades, 1);

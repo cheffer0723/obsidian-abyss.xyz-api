@@ -19,7 +19,7 @@ export interface HistoricalTradeReplay {
   executionCapable: false;
   source: typeof FROZEN_ENGINE_SOURCE;
   limits: string[];
-  coverage: { totalTrades: number; withMarketHistory: number; withoutMarketHistory: number; symbolsTested: string[]; symbolsNotTested: string[] };
+  coverage: { totalTrades: number; withMarketHistory: number; withoutMarketHistory: number; outOfRangeMarketHistory: number; symbolsTested: string[]; symbolsNotTested: string[] };
   testedTradeProfile: {
     trades: number;
     wins: number;
@@ -55,7 +55,7 @@ export interface HistoricalTradeReplay {
     pnlUsd: number;
     outcome: "win" | "loss" | "flat";
     marketMovePct: number;
-    status: "evaluated" | "no_market_history";
+    status: "evaluated" | "no_market_history" | "market_history_out_of_range";
     priorCloseDate: string | null;
     engines: Array<{
       key: FrozenEngineKey;
@@ -147,9 +147,18 @@ export function replayClosedTrades(
       });
       continue;
     }
-    symbolsTested.add(symbol);
     const entryDay = new Date(trade.entryTimestamp).toISOString().slice(0, 10);
     const barIndex = latestStrictlyEarlierDate(history.bars, entryDay);
+    if (barIndex < 0 || historyIsStale(history, barIndex, entryDay)) {
+      symbolsNotTested.add(symbol);
+      tradeResults.push({
+        index, symbol, side: trade.side, entryTimestamp: trade.entryTimestamp, exitTimestamp: trade.exitTimestamp,
+        holdingMinutes, pnlUsd: round(trade.pnlUsd, 8), outcome: outcome(trade.pnlUsd), marketMovePct,
+        status: "market_history_out_of_range", priorCloseDate: barIndex >= 0 ? history.bars[barIndex].date : null, engines: [],
+      });
+      continue;
+    }
+    symbolsTested.add(symbol);
     const readings = FROZEN_ENGINES.map((engine) => {
       if (barIndex < engine.warmupBars(history.kind)) return { key: engine.key, signal: "insufficient_history" as const, relationship: null };
       const signal = history.signals[engine.key][barIndex];
@@ -171,13 +180,15 @@ export function replayClosedTrades(
     limits: [
       "These engines provide daily long-or-cash context; they do not issue short signals.",
       "Each trade uses the latest daily close from a strictly earlier calendar date.",
+      "Trades are excluded when the prior close is more than one calendar day old for crypto or four calendar days old for exchange-traded assets.",
       "A correct long-context direction over a user-chosen holding period is not a complete engine backtest or proof of predictive edge.",
-      "Trades without matching market history are reported as not tested and excluded from engine percentages.",
+      "Trades without matching or current-enough market history are reported as not tested and excluded from engine percentages.",
     ],
     coverage: {
       totalTrades: tradeResults.length,
       withMarketHistory: tradeResults.filter((trade) => trade.status === "evaluated").length,
-      withoutMarketHistory: tradeResults.filter((trade) => trade.status === "no_market_history").length,
+      withoutMarketHistory: tradeResults.filter((trade) => trade.status !== "evaluated").length,
+      outOfRangeMarketHistory: tradeResults.filter((trade) => trade.status === "market_history_out_of_range").length,
       symbolsTested: [...symbolsTested].sort(),
       symbolsNotTested: [...symbolsNotTested].sort(),
     },
@@ -231,6 +242,12 @@ function latestStrictlyEarlierDate(bars: readonly HistoricalClose[], entryDay: s
     else high = middle - 1;
   }
   return found;
+}
+
+function historyIsStale(history: PreparedHistory, barIndex: number, entryDay: string): boolean {
+  const priorDay = history.bars[barIndex].date;
+  const ageDays = (Date.parse(`${entryDay}T00:00:00Z`) - Date.parse(`${priorDay}T00:00:00Z`)) / 86_400_000;
+  return ageDays > (history.kind === "btc" ? 1 : 4);
 }
 
 function summarizeEngine(key: FrozenEngineKey, name: string, trades: HistoricalTradeReplay["trades"]): HistoricalTradeReplay["engines"][number] {
