@@ -1,4 +1,5 @@
 import { calculateFrozenEngineSignals, FROZEN_ENGINES, FROZEN_ENGINE_SOURCE, type BinarySignal, type FrozenEngineKey, type HistoricalClose, type MarketKind } from "./frozen-engines.js";
+import { parseCsvRows } from "./testing-harness.js";
 
 export interface ClosedTradeInput {
   symbol: string;
@@ -91,17 +92,42 @@ export function parseClosedTradesJsonl(jsonlText: string): ClosedTradeInput[] {
   return trades;
 }
 
+export const CLOSED_TRADE_CSV_HEADER = "symbol,side,entry_timestamp_utc,exit_timestamp_utc,entry_price,exit_price,pnl_usd";
+
+export function parseClosedTradesCsv(csvText: string): ClosedTradeInput[] {
+  const rows = parseCsvRows(csvText);
+  if (rows.length < 2) throw inputError("CSV must contain a header and at least one completed trade.");
+  const headers = rows[0].map((value) => value.trim().toLowerCase());
+  const indexes = new Map(headers.map((header, index) => [header, index]));
+  const requiredFields = CLOSED_TRADE_CSV_HEADER.split(",");
+  const missing = requiredFields.filter((field) => !indexes.has(field));
+  if (missing.length) throw inputError(`Completed-trade CSV fields missing: ${missing.join(", ")}.`);
+  const asJsonl = rows.slice(1).map((cells) => JSON.stringify({
+    status: "CLOSED",
+    symbol: cells[indexes.get("symbol")!],
+    side: cells[indexes.get("side")!],
+    entry_timestamp_utc: cells[indexes.get("entry_timestamp_utc")!],
+    exit_timestamp_utc: cells[indexes.get("exit_timestamp_utc")!],
+    entry_price: cells[indexes.get("entry_price")!],
+    exit_price: cells[indexes.get("exit_price")!],
+    pnl_usd: cells[indexes.get("pnl_usd")!],
+  })).join("\n");
+  return parseClosedTradesJsonl(asJsonl);
+}
+
 export function replayClosedTrades(
   trades: readonly ClosedTradeInput[],
   histories: Readonly<Record<string, readonly HistoricalClose[]>>,
-  marketKind: MarketKind = "btc",
+  marketKinds: MarketKind | Readonly<Record<string, MarketKind>> = "btc",
 ): HistoricalTradeReplay {
   if (!Array.isArray(trades) || !trades.length) throw inputError("trades must contain at least one closed trade.");
-  if (marketKind !== "eq" && marketKind !== "btc") throw inputError("marketKind must be eq or btc.");
+  if (typeof marketKinds === "string" && marketKinds !== "eq" && marketKinds !== "btc") throw inputError("marketKind must be eq or btc.");
   const prepared = new Map<string, PreparedHistory>();
   for (const [rawSymbol, bars] of Object.entries(histories || {})) {
     const symbol = normalizeSymbol(rawSymbol);
-    prepared.set(symbol, prepareHistory(symbol, bars, marketKind));
+    const kind = typeof marketKinds === "string" ? marketKinds : marketKinds[symbol];
+    if (kind !== "eq" && kind !== "btc") throw inputError(`Market kind for ${symbol} must be eq or btc.`);
+    prepared.set(symbol, prepareHistory(symbol, bars, kind));
   }
 
   const symbolsTested = new Set<string>(), symbolsNotTested = new Set<string>();
@@ -125,7 +151,7 @@ export function replayClosedTrades(
     const entryDay = new Date(trade.entryTimestamp).toISOString().slice(0, 10);
     const barIndex = latestStrictlyEarlierDate(history.bars, entryDay);
     const readings = FROZEN_ENGINES.map((engine) => {
-      if (barIndex < engine.warmupBars(marketKind)) return { key: engine.key, signal: "insufficient_history" as const, relationship: null };
+      if (barIndex < engine.warmupBars(history.kind)) return { key: engine.key, signal: "insufficient_history" as const, relationship: null };
       const signal = history.signals[engine.key][barIndex];
       return { key: engine.key, signal: signal ? "long" as const : "cash" as const, relationship: relationship(trade.side, signal) };
     });
@@ -180,6 +206,7 @@ function summarizeTradeGroup(trades: HistoricalTradeReplay["trades"]): { trades:
 
 interface PreparedHistory {
   bars: readonly HistoricalClose[];
+  kind: MarketKind;
   signals: Record<FrozenEngineKey, BinarySignal[]>;
 }
 
@@ -193,7 +220,7 @@ function prepareHistory(symbol: string, bars: readonly HistoricalClose[], kind: 
     if (bar.date <= previous) throw inputError(`Market history for ${symbol} must be sorted with unique dates.`);
     previous = bar.date;
   }
-  return { bars, signals: calculateFrozenEngineSignals(bars.map((bar) => bar.close), kind) };
+  return { bars, kind, signals: calculateFrozenEngineSignals(bars.map((bar) => bar.close), kind) };
 }
 
 function latestStrictlyEarlierDate(bars: readonly HistoricalClose[], entryDay: string): number {

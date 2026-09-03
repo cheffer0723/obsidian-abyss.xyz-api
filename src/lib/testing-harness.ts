@@ -46,7 +46,7 @@ export interface PaperAccountingReport {
 const KRAKEN_REQUIRED = ["txid", "ordertxid", "pair", "time", "type", "ordertype", "price", "cost", "fee", "vol", "margin"];
 
 export function importHistoricalCsv(csvText: string): KrakenImportResult {
-  const rows = parseCsv(csvText);
+  const rows = parseCsvRows(csvText);
   if (rows.length < 2) throw inputError("CSV must contain a header and at least one data row.");
   const headers = rows[0].map((v) => v.trim().toLowerCase());
   const index = new Map(headers.map((header, i) => [header, i]));
@@ -149,7 +149,7 @@ export function validateClosedPaperTradesJsonl(jsonlText: string, toleranceUsd =
   };
 }
 
-function parseCsv(text: string): string[][] {
+export function parseCsvRows(text: string): string[][] {
   const input = String(text || "").replace(/^\uFEFF/, "");
   const rows: string[][] = [];
   let row: string[] = [], cell = "", quoted = false;

@@ -9,7 +9,8 @@
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "test:harness": "node scripts/run-testing-harness-tests.mjs"
+    "test:harness": "node scripts/run-testing-harness-tests.mjs",
+    "build:harness-data": "node scripts/build-testing-market-history.mjs"
   },
   "engines": {
     "node": ">=20"

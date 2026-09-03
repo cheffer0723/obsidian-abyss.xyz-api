@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { importHistoricalCsv } from "../lib/testing-harness.js";
 import { evaluateFrozenEngines, type HistoricalClose, type MarketKind } from "../lib/frozen-engines.js";
-import { replayClosedTrades, type ClosedTradeInput } from "../lib/trade-replay.js";
+import { CLOSED_TRADE_CSV_HEADER, parseClosedTradesCsv, replayClosedTrades, type ClosedTradeInput } from "../lib/trade-replay.js";
+import { requireActiveSubscription } from "../lib/access.js";
+import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore } from "../lib/testing-market-history.js";
 
 const router = Router();
 
@@ -19,7 +21,7 @@ router.post("/testing-harness/import", (req, res, next) => {
   }
 });
 
-router.post("/testing-harness/engines/evaluate", (req, res, next) => {
+router.post("/testing-harness/engines/evaluate", requireActiveSubscription, (req, res, next) => {
   try {
     const body = req.body && typeof req.body === "object" ? req.body as { marketKind?: unknown; bars?: unknown } : {};
     res.json(evaluateFrozenEngines(body.bars as HistoricalClose[], body.marketKind as MarketKind));
@@ -28,19 +30,27 @@ router.post("/testing-harness/engines/evaluate", (req, res, next) => {
   }
 });
 
-router.post("/testing-harness/replay", (req, res, next) => {
+router.post("/testing-harness/replay", requireActiveSubscription, (req, res, next) => {
   try {
-    const body = req.body && typeof req.body === "object"
-      ? req.body as { trades?: unknown; histories?: unknown; marketKind?: unknown }
-      : {};
+    const body = req.body && typeof req.body === "object" ? req.body as { trades?: unknown; csv?: unknown } : {};
+    const trades = typeof req.body === "string"
+      ? parseClosedTradesCsv(req.body)
+      : typeof body.csv === "string"
+        ? parseClosedTradesCsv(body.csv)
+        : body.trades as ClosedTradeInput[];
+    const store = loadTestingMarketHistory();
     res.json(replayClosedTrades(
-      body.trades as ClosedTradeInput[],
-      body.histories as Record<string, HistoricalClose[]>,
-      (body.marketKind || "btc") as MarketKind,
+      trades,
+      historiesFromStore(store),
+      marketKindsFromStore(store),
     ));
   } catch (error) {
     next(error);
   }
+});
+
+router.get("/testing-harness/template", (_req, res) => {
+  res.type("text/csv").send(`${CLOSED_TRADE_CSV_HEADER}\n`);
 });
 
 export default router;

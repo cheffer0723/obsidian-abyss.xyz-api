@@ -4,7 +4,9 @@ import fs from "node:fs";
 import express from "express";
 import { importHistoricalCsv, validateClosedPaperTradesJsonl } from "../src/lib/testing-harness.js";
 import { calculateFrozenEngineSignals, evaluateFrozenEngines, FROZEN_ENGINE_SOURCE } from "../src/lib/frozen-engines.js";
-import { parseClosedTradesJsonl, replayClosedTrades, type ClosedTradeInput } from "../src/lib/trade-replay.js";
+import { parseClosedTradesCsv, parseClosedTradesJsonl, replayClosedTrades, type ClosedTradeInput } from "../src/lib/trade-replay.js";
+import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore } from "../src/lib/testing-market-history.js";
+import { createRequireActiveSubscription } from "../src/lib/access.js";
 import testingHarnessRouter from "../src/routes/testing-harness.js";
 
 const header = "txid,ordertxid,pair,aclass,subclass,time,type,ordertype,price,cost,fee,vol,margin,misc,ledgers,posttxid,posstatuscode,cprice,ccost,cfee,cvol,cmargin,net,costusd,trades";
@@ -35,6 +37,12 @@ assert.equal(paperReport.invalidRows, 1);
 const parsedPaper = parseClosedTradesJsonl(paper);
 assert.equal(parsedPaper.length, 1);
 assert.equal(parsedPaper[0].symbol, "BTC-USD");
+const completedTradeCsv = [
+  "symbol,side,entry_timestamp_utc,exit_timestamp_utc,entry_price,exit_price,pnl_usd",
+  "BTC/USD,LONG,2026-01-01T00:00:00Z,2026-01-02T00:00:00Z,100,110,9",
+].join("\n");
+assert.deepEqual(parseClosedTradesCsv(completedTradeCsv), [{ symbol: "BTC-USD", side: "LONG", entryTimestamp: "2026-01-01T00:00:00Z", exitTimestamp: "2026-01-02T00:00:00Z", entryPrice: 100, exitPrice: 110, pnlUsd: 9 }]);
+assert.throws(() => parseClosedTradesCsv("symbol,side\nBTC-USD,LONG"), /fields missing/);
 
 // These expected indices independently reproduce pandas rolling/pct_change behavior in the frozen Python source.
 const rising = Array.from({ length: 205 }, (_, index) => index + 1);
@@ -71,6 +79,31 @@ assert.equal(syntheticReplay.trades[0].priorCloseDate, datedBars.at(-1)!.date);
 assert.equal(syntheticReplay.engines.find((engine) => engine.key === "orthrus")?.supportedUserLongs.wins, 1);
 assert.equal(syntheticReplay.engines.find((engine) => engine.key === "sisyphus")?.unsupportedUserLongs.trades, 1);
 assert.throws(() => replayClosedTrades(syntheticTrades, {}, "invalid" as "btc"), /marketKind/);
+const bundledMarketHistory = loadTestingMarketHistory();
+assert.equal(Object.keys(bundledMarketHistory.assets).length, 9);
+assert.deepEqual(Object.keys(bundledMarketHistory.assets).sort(), ["BTC-USD", "ETH-USD", "GLD", "IWM", "NVDA", "QQQ", "SOL-USD", "SPY", "TLT"]);
+assert.equal(bundledMarketHistory.assets["BTC-USD"].lastDate, "2026-06-26");
+assert.equal(replayClosedTrades(syntheticTrades, historiesFromStore(bundledMarketHistory), marketKindsFromStore(bundledMarketHistory)).coverage.withMarketHistory, 1);
+
+async function accessStatus(user: { id: string; email: string } | null, active: boolean): Promise<number> {
+  const app = express();
+  app.get("/protected", createRequireActiveSubscription({
+    databaseReady: () => true,
+    currentUser: async () => user,
+    entitlementFor: async () => ({ active, status: active ? "active" : null }),
+  }), (_req, res) => res.json({ ok: true }));
+  const instance = app.listen(0);
+  try {
+    const address = instance.address();
+    assert.ok(address && typeof address === "object");
+    return (await fetch(`http://127.0.0.1:${address.port}/protected`)).status;
+  } finally {
+    await new Promise<void>((resolve, reject) => instance.close((error) => error ? reject(error) : resolve()));
+  }
+}
+assert.equal(await accessStatus(null, false), 401);
+assert.equal(await accessStatus({ id: "user", email: "user@example.com" }, false), 403);
+assert.equal(await accessStatus({ id: "user", email: "user@example.com" }, true), 200);
 
 const fixture = process.env.KRAKEN_TRADES_FIXTURE;
 if (fixture) {
@@ -181,33 +214,29 @@ try {
   const engineResponse = await fetch(`${base}/api/testing-harness/engines/evaluate`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ marketKind: "eq", bars: datedBars }),
   });
-  assert.equal(engineResponse.status, 200);
-  const engineBody = await engineResponse.json() as { purpose: string; executionCapable: boolean; engines: unknown[] };
-  assert.equal(engineBody.purpose, "historical_testing_only");
-  assert.equal(engineBody.executionCapable, false);
-  assert.equal(engineBody.engines.length, 3);
+  assert.equal(engineResponse.status, 503);
 
   const invalidEngine = await fetch(`${base}/api/testing-harness/engines/evaluate`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ marketKind: "eq", bars: [{ date: "bad", close: 1 }] }),
   });
-  assert.equal(invalidEngine.status, 400);
+  assert.equal(invalidEngine.status, 503);
 
   const replayResponse = await fetch(`${base}/api/testing-harness/replay`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ marketKind: "eq", trades: syntheticTrades, histories: { "BTC-USD": datedBars } }),
+    body: JSON.stringify({ trades: syntheticTrades, histories: { "ATTACKER-SUPPLIED": datedBars } }),
   });
-  assert.equal(replayResponse.status, 200);
-  const replayBody = await replayResponse.json() as { purpose: string; executionCapable: boolean; coverage: { totalTrades: number } };
-  assert.equal(replayBody.purpose, "historical_testing_only");
-  assert.equal(replayBody.executionCapable, false);
-  assert.equal(replayBody.coverage.totalTrades, 2);
+  assert.equal(replayResponse.status, 503);
+
+  const templateResponse = await fetch(`${base}/api/testing-harness/template`);
+  assert.equal(templateResponse.status, 200);
+  assert.equal((await templateResponse.text()).trim(), "symbol,side,entry_timestamp_utc,exit_timestamp_utc,entry_price,exit_price,pnl_usd");
 } finally {
   await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
 }
 
 console.log(JSON.stringify({
   ok: true,
-  checks: ["synthetic-import", "validation-errors", "private-fixture", "paper-accounting", "frozen-engine-parity", "trade-replay", "engine-http-route", "replay-http-route", "http-route", "historical-only-boundary"],
+  checks: ["synthetic-import", "validation-errors", "private-fixture", "paper-accounting", "frozen-engine-parity", "trade-replay", "bundled-market-history", "subscription-access", "engine-http-route", "replay-http-route", "http-route", "historical-only-boundary"],
   recoveredPaperAccounting,
   recoveredEngineParity,
   recoveredTradeReplay: recoveredTradeReplay ? {
