@@ -34,7 +34,7 @@ app.use(
   }),
 );
 app.disable("x-powered-by");
-const allowedOrigins = new Set(["https://obsidian-abyss.xyz", "https://www.obsidian-abyss.xyz", ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)]);
+const allowedOrigins = new Set(["https://obsidian-abyss.xyz", "https://www.obsidian-abyss.xyz", "https://obsidianabyss.com", "https://www.obsidianabyss.com", ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)]);
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)), credentials: true }));
 app.use(cookieParser());
 // Stripe requires the untouched raw request body for signed webhook verification.
