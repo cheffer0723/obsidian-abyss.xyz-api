@@ -1,10 +1,11 @@
 import type { Request, RequestHandler } from "express";
-import { currentUser, databaseReady, entitlementFor } from "./account.js";
+import { currentUser, databaseReady, entitlementFor, isAdminEmail } from "./account.js";
 
 type AccessDependencies = {
   databaseReady: () => boolean;
   currentUser: (req: Request) => Promise<{ id: string; email: string } | null>;
   entitlementFor: (userId: string) => Promise<{ active: boolean; status: string | null }>;
+  isAdminEmail: (email: string) => boolean;
 };
 
 export function createRequireActiveSubscription(dependencies: AccessDependencies): RequestHandler {
@@ -17,6 +18,11 @@ export function createRequireActiveSubscription(dependencies: AccessDependencies
     const user = await dependencies.currentUser(req);
     if (!user) {
       res.status(401).json({ ok: false, error: "Sign-in is required." });
+      return;
+    }
+    if (dependencies.isAdminEmail(user.email)) {
+      res.locals.user = { id: user.id, email: user.email, admin: true };
+      next();
       return;
     }
     const entitlement = await dependencies.entitlementFor(user.id);
@@ -32,4 +38,4 @@ export function createRequireActiveSubscription(dependencies: AccessDependencies
   };
 }
 
-export const requireActiveSubscription = createRequireActiveSubscription({ databaseReady, currentUser, entitlementFor });
+export const requireActiveSubscription = createRequireActiveSubscription({ databaseReady, currentUser, entitlementFor, isAdminEmail });

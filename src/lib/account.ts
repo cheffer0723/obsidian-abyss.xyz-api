@@ -24,14 +24,23 @@ function hash(value: string): string { return crypto.createHash("sha256").update
 function randomToken(): string { return crypto.randomBytes(32).toString("base64url"); }
 function normalizeEmail(email: string): string { return email.trim().toLowerCase(); }
 
-export async function requestMagicLink(emailInput: string): Promise<void> {
+export function isAdminEmail(email: string): boolean {
+  const normalized = normalizeEmail(email);
+  return (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map(normalizeEmail)
+    .filter(Boolean)
+    .includes(normalized);
+}
+
+export async function requestMagicLink(emailInput: string, returnTo = "/"): Promise<void> {
   await ensureSchema();
   const email = normalizeEmail(emailInput);
   const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
   const token = randomToken();
   await pool!.query(`INSERT INTO abyss_auth_tokens (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '20 minutes')`, [hash(token), user.rows[0].id]);
   const apiUrl = (process.env.AUTH_API_URL || "https://webapp-backend-production-7f0f.up.railway.app/api").replace(/\/$/, "");
-  const link = `${apiUrl}/auth/verify?token=${encodeURIComponent(token)}`;
+  const link = `${apiUrl}/auth/verify?token=${encodeURIComponent(token)}&returnTo=${encodeURIComponent(returnTo)}`;
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     logger.warn({ emailDomain: email.split("@")[1] }, "Magic link not sent: SMTP is not configured");
     return;

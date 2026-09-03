@@ -7,6 +7,7 @@ import { calculateFrozenEngineSignals, evaluateFrozenEngines, FROZEN_ENGINE_SOUR
 import { parseClosedTradesCsv, parseClosedTradesJsonl, replayClosedTrades, type ClosedTradeInput } from "../src/lib/trade-replay.js";
 import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore } from "../src/lib/testing-market-history.js";
 import { createRequireActiveSubscription } from "../src/lib/access.js";
+import { isAdminEmail } from "../src/lib/account.js";
 import testingHarnessRouter from "../src/routes/testing-harness.js";
 
 const header = "txid,ordertxid,pair,aclass,subclass,time,type,ordertype,price,cost,fee,vol,margin,misc,ledgers,posttxid,posstatuscode,cprice,ccost,cfee,cvol,cmargin,net,costusd,trades";
@@ -91,12 +92,13 @@ assert.deepEqual(Object.keys(bundledMarketHistory.assets).sort(), ["BTC-USD", "E
 assert.equal(bundledMarketHistory.assets["BTC-USD"].lastDate, "2026-06-26");
 assert.equal(replayClosedTrades(syntheticTrades, historiesFromStore(bundledMarketHistory), marketKindsFromStore(bundledMarketHistory)).coverage.withMarketHistory, 1);
 
-async function accessStatus(user: { id: string; email: string } | null, active: boolean): Promise<number> {
+async function accessStatus(user: { id: string; email: string } | null, active: boolean, admin = false): Promise<number> {
   const app = express();
   app.get("/protected", createRequireActiveSubscription({
     databaseReady: () => true,
     currentUser: async () => user,
     entitlementFor: async () => ({ active, status: active ? "active" : null }),
+    isAdminEmail: () => admin,
   }), (_req, res) => res.json({ ok: true }));
   const instance = app.listen(0);
   try {
@@ -110,6 +112,13 @@ async function accessStatus(user: { id: string; email: string } | null, active: 
 assert.equal(await accessStatus(null, false), 401);
 assert.equal(await accessStatus({ id: "user", email: "user@example.com" }, false), 403);
 assert.equal(await accessStatus({ id: "user", email: "user@example.com" }, true), 200);
+assert.equal(await accessStatus({ id: "owner", email: "owner@example.com" }, false, true), 200);
+const priorAdminEmails = process.env.ADMIN_EMAILS;
+process.env.ADMIN_EMAILS = "owner@example.com, second@example.com";
+assert.equal(isAdminEmail(" OWNER@example.com "), true);
+assert.equal(isAdminEmail("user@example.com"), false);
+if (priorAdminEmails === undefined) delete process.env.ADMIN_EMAILS;
+else process.env.ADMIN_EMAILS = priorAdminEmails;
 
 const fixture = process.env.KRAKEN_TRADES_FIXTURE;
 if (fixture) {
