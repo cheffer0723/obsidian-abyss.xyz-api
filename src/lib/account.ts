@@ -26,8 +26,20 @@ async function ensureSchema(): Promise<void> {
       matched_trade_count integer,
       metadata jsonb NOT NULL DEFAULT '{}'::jsonb
     );
+    CREATE TABLE IF NOT EXISTS abyss_beta_feedback (
+      id uuid PRIMARY KEY,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      category text NOT NULL,
+      message text NOT NULL,
+      contact_email text,
+      page_path text,
+      user_agent text,
+      user_id uuid REFERENCES abyss_users(id) ON DELETE SET NULL
+    );
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS abyss_beta_feedback_created_at_idx ON abyss_beta_feedback (created_at DESC);
+    CREATE INDEX IF NOT EXISTS abyss_beta_feedback_category_idx ON abyss_beta_feedback (category, created_at DESC);
   `).then(() => undefined);
   await schemaReady;
 }
@@ -247,3 +259,114 @@ function finitePositiveInteger(value: unknown): number | null {
 }
 
 function round(value: number, places: number): number { return Number(value.toFixed(places)); }
+
+export type BetaFeedbackCategory = "comment" | "concern" | "bug" | "idea";
+
+export type BetaFeedbackInput = {
+  category: BetaFeedbackCategory;
+  message: string;
+  contactEmail?: string | null;
+  pagePath?: string | null;
+  userAgent?: string | null;
+  userId?: string | null;
+};
+
+export type BetaFeedbackRow = {
+  id: string;
+  createdAt: string;
+  category: BetaFeedbackCategory;
+  message: string;
+  contactEmail: string | null;
+  pagePath: string | null;
+};
+
+export async function submitBetaFeedback(input: BetaFeedbackInput): Promise<{ id: string }> {
+  await ensureSchema();
+  const id = crypto.randomUUID();
+  const message = input.message.trim();
+  if (message.length < 8 || message.length > 4000) {
+    throw new Error("Feedback must be between 8 and 4000 characters.");
+  }
+  const contactEmail = input.contactEmail ? normalizeEmail(input.contactEmail) : null;
+  if (contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+    throw new Error("That contact email does not look valid.");
+  }
+  await pool!.query(
+    `INSERT INTO abyss_beta_feedback (id, category, message, contact_email, page_path, user_agent, user_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      id,
+      input.category,
+      message,
+      contactEmail,
+      (input.pagePath || "").trim().slice(0, 200) || null,
+      (input.userAgent || "").trim().slice(0, 400) || null,
+      input.userId || null,
+    ],
+  );
+  void notifyFeedbackSubmitted({ id, category: input.category, message, contactEmail });
+  return { id };
+}
+
+export async function listBetaFeedback(limit = 50): Promise<BetaFeedbackRow[]> {
+  await ensureSchema();
+  const capped = Math.min(Math.max(limit, 1), 100);
+  const rows = await pool!.query<{
+    id: string;
+    created_at: Date;
+    category: BetaFeedbackCategory;
+    message: string;
+    contact_email: string | null;
+    page_path: string | null;
+  }>(
+    `SELECT id, created_at, category, message, contact_email, page_path
+     FROM abyss_beta_feedback
+     ORDER BY created_at DESC
+     LIMIT $1`,
+    [capped],
+  );
+  return rows.rows.map((row) => ({
+    id: row.id,
+    createdAt: row.created_at.toISOString(),
+    category: row.category,
+    message: row.message,
+    contactEmail: row.contact_email,
+    pagePath: row.page_path,
+  }));
+}
+
+async function notifyFeedbackSubmitted(input: {
+  id: string;
+  category: string;
+  message: string;
+  contactEmail: string | null;
+}): Promise<void> {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return;
+  const recipients = (process.env.FEEDBACK_NOTIFY_EMAILS || process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map(normalizeEmail)
+    .filter(Boolean);
+  if (!recipients.length) return;
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM || process.env.SMTP_USER,
+      to: recipients.join(","),
+      subject: `[Obsidian Abyss beta] ${input.category}: feedback received`,
+      text: [
+        `Category: ${input.category}`,
+        `Contact: ${input.contactEmail || "(not provided)"}`,
+        `Id: ${input.id}`,
+        "",
+        input.message,
+      ].join("\n"),
+    });
+  } catch (error) {
+    logger.warn({ feedbackId: input.id, error: error instanceof Error ? error.name : "unknown" }, "Feedback notify email failed");
+  }
+}
