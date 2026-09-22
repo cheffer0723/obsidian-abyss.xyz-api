@@ -27,18 +27,32 @@ type MarketHistoryDelta = {
 
 let cached: TestingMarketHistory | null = null;
 
-function loadDelta(deltaPath: string): MarketHistoryDelta | null {
-  if (!fs.existsSync(deltaPath)) return null;
-  const raw = fs.readFileSync(deltaPath, "utf8").trim();
+function readDeltaB64(dir: string): string | null {
+  const p0 = path.join(dir, "market-history.delta.b64.0");
+  const p1 = path.join(dir, "market-history.delta.b64.1");
+  if (fs.existsSync(p0) && fs.existsSync(p1)) {
+    return (fs.readFileSync(p0, "utf8") + fs.readFileSync(p1, "utf8")).trim();
+  }
+  const single = path.join(dir, "market-history.delta.b64");
+  if (fs.existsSync(single)) return fs.readFileSync(single, "utf8").trim();
+  return null;
+}
+
+function loadDelta(dir: string): MarketHistoryDelta | null {
   try {
-    if (deltaPath.endsWith(".b64")) {
-      const buf = zlib.gunzipSync(Buffer.from(raw, "base64"));
+    const b64 = readDeltaB64(dir);
+    if (b64) {
+      const buf = zlib.gunzipSync(Buffer.from(b64, "base64"));
       return JSON.parse(buf.toString("utf8")) as MarketHistoryDelta;
     }
-    return JSON.parse(raw) as MarketHistoryDelta;
+    const jsonPath = path.join(dir, "market-history.delta.json");
+    if (fs.existsSync(jsonPath)) {
+      return JSON.parse(fs.readFileSync(jsonPath, "utf8")) as MarketHistoryDelta;
+    }
   } catch {
     return null;
   }
+  return null;
 }
 
 function applyDelta(base: TestingMarketHistory, delta: MarketHistoryDelta): TestingMarketHistory {
@@ -84,10 +98,7 @@ export function loadTestingMarketHistory(): TestingMarketHistory {
   if (parsed?.purpose !== "historical_testing_only" || !parsed.assets || typeof parsed.assets !== "object") {
     throw serviceError("Historical market data failed validation.");
   }
-  const dir = path.dirname(filename);
-  const delta =
-    loadDelta(path.join(dir, "market-history.delta.b64")) ||
-    loadDelta(path.join(dir, "market-history.delta.json"));
+  const delta = loadDelta(path.dirname(filename));
   if (delta) parsed = applyDelta(parsed, delta);
   cached = parsed;
   return parsed;
