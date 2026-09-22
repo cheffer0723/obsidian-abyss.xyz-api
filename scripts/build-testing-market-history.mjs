@@ -46,12 +46,13 @@ const partsDir = path.resolve("data/testing-harness/market-history.parts");
 fs.rmSync(partsDir, { recursive: true, force: true });
 fs.mkdirSync(partsDir, { recursive: true });
 const chunk = 12_000;
-const shardChars = 2_000;
+const shardChars = 2_000; // short base64 shards stay accurate through GitHub MCP text uploads
 let partCount = 0;
 for (let offset = 0; offset < compressed.length; offset += chunk) {
   const slice = compressed.subarray(offset, offset + chunk);
   const stem = String(partCount).padStart(3, "0");
   const b64 = slice.toString("base64");
+  // Full part (local/dev) plus MCP-friendly shards (*.gz.part.b64.SS).
   fs.writeFileSync(path.join(partsDir, `${stem}.gz.part.b64`), b64);
   let shard = 0;
   for (let i = 0; i < b64.length; i += shardChars) {
