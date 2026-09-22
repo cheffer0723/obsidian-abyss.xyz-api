@@ -36,10 +36,23 @@ async function ensureSchema(): Promise<void> {
       user_agent text,
       user_id uuid REFERENCES abyss_users(id) ON DELETE SET NULL
     );
+    CREATE TABLE IF NOT EXISTS abyss_login_intents (
+      id uuid PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      token_hash text NOT NULL REFERENCES abyss_auth_tokens(token_hash) ON DELETE CASCADE,
+      return_to text NOT NULL DEFAULT '/',
+      status text NOT NULL DEFAULT 'pending',
+      claim_code_hash text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      approved_at timestamptz,
+      claimed_at timestamptz
+    );
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_beta_feedback_created_at_idx ON abyss_beta_feedback (created_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_beta_feedback_category_idx ON abyss_beta_feedback (category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS abyss_login_intents_status_idx ON abyss_login_intents (status, expires_at);
   `).then(() => undefined);
   await schemaReady;
 }
@@ -57,38 +70,120 @@ export function isAdminEmail(email: string): boolean {
     .includes(normalized);
 }
 
-export async function requestMagicLink(emailInput: string, returnTo = "/"): Promise<void> {
+function setSessionCookie(res: Response, session: string): void {
+  // Pages frontend and Railway API are different sites; Secure + None is required
+  // for credentialed cross-site fetches after verify/claim.
+  res.cookie("abyss_session", session, { httpOnly: true, secure: true, sameSite: "none", maxAge: 30 * 24 * 60 * 60 * 1000 });
+}
+
+async function createSession(userId: string, res: Response): Promise<void> {
+  const session = randomToken();
+  await pool!.query(`INSERT INTO abyss_sessions (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '30 days')`, [hash(session), userId]);
+  setSessionCookie(res, session);
+}
+
+export async function requestMagicLink(
+  emailInput: string,
+  returnTo = "/",
+): Promise<{ loginIntentId: string; waiterSecret: string }> {
   await ensureSchema();
   const email = normalizeEmail(emailInput);
   const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
   const token = randomToken();
-  await pool!.query(`INSERT INTO abyss_auth_tokens (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '20 minutes')`, [hash(token), user.rows[0].id]);
+  const tokenHash = hash(token);
+  const loginIntentId = crypto.randomUUID();
+  const waiterSecret = randomToken();
+  await pool!.query(`INSERT INTO abyss_auth_tokens (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '20 minutes')`, [tokenHash, user.rows[0].id]);
+  await pool!.query(
+    `INSERT INTO abyss_login_intents (id, user_id, token_hash, return_to, status, claim_code_hash, expires_at)
+     VALUES ($1,$2,$3,$4,'pending',$5,now()+interval '20 minutes')`,
+    [loginIntentId, user.rows[0].id, tokenHash, returnTo, hash(waiterSecret)],
+  );
   void recordMetricEvent({ eventType: "magic_link_requested", outcome: "accepted" });
   const apiUrl = (process.env.AUTH_API_URL || "https://webapp-backend-production-7f0f.up.railway.app/api").replace(/\/$/, "");
   const link = `${apiUrl}/auth/verify?token=${encodeURIComponent(token)}&returnTo=${encodeURIComponent(returnTo)}`;
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     logger.warn({ emailDomain: email.split("@")[1] }, "Magic link not sent: SMTP is not configured");
-    return;
+    return { loginIntentId, waiterSecret };
   }
   const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === "true", auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
   try {
-    await transporter.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to: email, subject: "Your Obsidian Abyss sign-in link", text: `Enter the Abyss: ${link}\n\nThis link expires in 20 minutes and can be used once.` });
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM || process.env.SMTP_USER,
+      to: email,
+      subject: "Your Obsidian Abyss sign-in link",
+      text: [
+        `Enter the Abyss: ${link}`,
+        "",
+        "Open this link on any device. The computer that requested sign-in will finish automatically.",
+        "This link expires in 20 minutes and can be used once.",
+      ].join("\n"),
+    });
   } catch (error) {
     logger.warn({ emailDomain: email.split("@")[1], error: error instanceof Error ? error.name : "unknown" }, "Magic link delivery failed");
   }
+  return { loginIntentId, waiterSecret };
 }
 
 export async function verifyMagicLink(token: string, res: Response): Promise<boolean> {
   await ensureSchema();
-  const session = randomToken();
   const result = await pool!.query<{ user_id: string }>(`UPDATE abyss_auth_tokens SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() RETURNING user_id`, [hash(token)]);
   if (!result.rowCount) return false;
-  await pool!.query(`INSERT INTO abyss_sessions (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '30 days')`, [hash(session), result.rows[0].user_id]);
+  await createSession(result.rows[0].user_id, res);
   void recordMetricEvent({ eventType: "magic_link_verified", outcome: "success" });
-  // The Pages frontend and Railway API are different sites; Secure + None is
-  // required for the browser to send this HttpOnly session cookie cross-site.
-  res.cookie("abyss_session", session, { httpOnly: true, secure: true, sameSite: "none", maxAge: 30 * 24 * 60 * 60 * 1000 });
+  await pool!.query(
+    `UPDATE abyss_login_intents
+     SET status='approved', approved_at=now()
+     WHERE token_hash=$1 AND status='pending' AND expires_at>now()`,
+    [hash(token)],
+  );
   return true;
+}
+
+export type LoginClaimResult =
+  | { status: "pending"; returnTo: string }
+  | { status: "claimed"; returnTo: string }
+  | { status: "expired"; returnTo: string }
+  | { status: "invalid" };
+
+export async function claimLoginIntent(intentId: string, waiterSecret: string, res: Response): Promise<LoginClaimResult> {
+  await ensureSchema();
+  const result = await pool!.query<{
+    user_id: string;
+    return_to: string;
+    status: string;
+    claim_code_hash: string | null;
+    expires_at: Date;
+  }>(
+    `SELECT user_id, return_to, status, claim_code_hash, expires_at
+     FROM abyss_login_intents WHERE id=$1`,
+    [intentId],
+  );
+  const row = result.rows[0];
+  if (!row || !row.claim_code_hash || row.claim_code_hash !== hash(waiterSecret)) {
+    return { status: "invalid" };
+  }
+  if (row.expires_at.getTime() <= Date.now()) {
+    if (row.status === "pending" || row.status === "approved") {
+      await pool!.query(`UPDATE abyss_login_intents SET status='expired' WHERE id=$1 AND status IN ('pending','approved')`, [intentId]);
+    }
+    return { status: "expired", returnTo: row.return_to };
+  }
+  if (row.status === "pending") return { status: "pending", returnTo: row.return_to };
+  if (row.status === "claimed") return { status: "claimed", returnTo: row.return_to };
+  if (row.status === "expired") return { status: "expired", returnTo: row.return_to };
+  if (row.status !== "approved") return { status: "invalid" };
+
+  const updated = await pool!.query<{ user_id: string; return_to: string }>(
+    `UPDATE abyss_login_intents
+     SET status='claimed', claimed_at=now()
+     WHERE id=$1 AND status='approved' AND claim_code_hash=$2
+     RETURNING user_id, return_to`,
+    [intentId, hash(waiterSecret)],
+  );
+  if (!updated.rowCount) return { status: "pending", returnTo: row.return_to };
+  await createSession(updated.rows[0].user_id, res);
+  return { status: "claimed", returnTo: updated.rows[0].return_to };
 }
 
 export async function currentUser(req: Request): Promise<{ id: string; email: string } | null> {
