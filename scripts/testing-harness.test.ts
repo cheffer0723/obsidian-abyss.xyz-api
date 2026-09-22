@@ -89,7 +89,11 @@ assert.throws(() => replayClosedTrades(syntheticTrades, {}, "invalid" as "btc"),
 const bundledMarketHistory = loadTestingMarketHistory();
 assert.equal(Object.keys(bundledMarketHistory.assets).length, 9);
 assert.deepEqual(Object.keys(bundledMarketHistory.assets).sort(), ["BTC-USD", "ETH-USD", "GLD", "IWM", "NVDA", "QQQ", "SOL-USD", "SPY", "TLT"]);
-assert.equal(bundledMarketHistory.assets["BTC-USD"].lastDate, "2026-06-26");
+assert.match(bundledMarketHistory.assets["BTC-USD"].lastDate, /^\d{4}-\d{2}-\d{2}$/);
+assert.ok(
+  bundledMarketHistory.assets["BTC-USD"].lastDate >= "2026-09-22",
+  `bundled market history must stay current enough for beta trades (got ${bundledMarketHistory.assets["BTC-USD"].lastDate})`,
+);
 assert.equal(replayClosedTrades(syntheticTrades, historiesFromStore(bundledMarketHistory), marketKindsFromStore(bundledMarketHistory)).coverage.withMarketHistory, 1);
 
 async function accessStatus(user: { id: string; email: string } | null, active: boolean, admin = false): Promise<number> {
