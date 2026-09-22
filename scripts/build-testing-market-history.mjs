@@ -46,12 +46,21 @@ const partsDir = path.resolve("data/testing-harness/market-history.parts");
 fs.rmSync(partsDir, { recursive: true, force: true });
 fs.mkdirSync(partsDir, { recursive: true });
 const chunk = 12_000;
+const shardChars = 2_000;
 let partCount = 0;
 for (let offset = 0; offset < compressed.length; offset += chunk) {
   const slice = compressed.subarray(offset, offset + chunk);
   const stem = String(partCount).padStart(3, "0");
-  // Base64 text parts are git/MCP-friendly; loader prefers *.gz.part.b64 over binary *.gz.part.
-  fs.writeFileSync(path.join(partsDir, `${stem}.gz.part.b64`), slice.toString("base64"));
+  const b64 = slice.toString("base64");
+  fs.writeFileSync(path.join(partsDir, `${stem}.gz.part.b64`), b64);
+  let shard = 0;
+  for (let i = 0; i < b64.length; i += shardChars) {
+    fs.writeFileSync(
+      path.join(partsDir, `${stem}.gz.part.b64.${String(shard).padStart(2, "0")}`),
+      b64.slice(i, i + shardChars),
+    );
+    shard += 1;
+  }
   partCount += 1;
 }
 
