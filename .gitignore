@@ -16,3 +16,6 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Local harness snapshot — published via the site at /harness/market-history.json
+data/testing-harness/market-history.json

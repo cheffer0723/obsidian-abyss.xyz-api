@@ -3,7 +3,7 @@ import { importHistoricalCsv } from "../lib/testing-harness.js";
 import { evaluateFrozenEngines, type HistoricalClose, type MarketKind } from "../lib/frozen-engines.js";
 import { CLOSED_TRADE_CSV_HEADER, parseClosedTradesCsv, replayClosedTrades, type ClosedTradeInput } from "../lib/trade-replay.js";
 import { requireActiveSubscription } from "../lib/access.js";
-import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore } from "../lib/testing-market-history.js";
+import { historiesFromStore, loadTestingMarketHistory, marketKindsFromStore, warmTestingMarketHistory } from "../lib/testing-market-history.js";
 import { recordMetricEvent } from "../lib/account.js";
 
 const router = Router();
@@ -31,7 +31,7 @@ router.post("/testing-harness/engines/evaluate", requireActiveSubscription, (req
   }
 });
 
-router.post("/testing-harness/replay", requireActiveSubscription, (req, res, next) => {
+router.post("/testing-harness/replay", requireActiveSubscription, async (req, res, next) => {
   const startedAt = Date.now();
   try {
     const body = req.body && typeof req.body === "object" ? req.body as { trades?: unknown; csv?: unknown } : {};
@@ -40,6 +40,7 @@ router.post("/testing-harness/replay", requireActiveSubscription, (req, res, nex
       : typeof body.csv === "string"
         ? parseClosedTradesCsv(body.csv)
         : body.trades as ClosedTradeInput[];
+    await warmTestingMarketHistory();
     const store = loadTestingMarketHistory();
     const replay = replayClosedTrades(
       trades,

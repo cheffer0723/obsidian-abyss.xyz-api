@@ -1,5 +1,6 @@
 import app from "./app.js";
 import { logger } from "./lib/logger.js";
+import { warmTestingMarketHistory } from "./lib/testing-market-history.js";
 
 const rawPort = process.env.PORT || "3001";
 const port = Number(rawPort);
@@ -24,4 +25,10 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+  void warmTestingMarketHistory().catch((error) => {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      "Harness market history not warmed at boot; first replay will retry",
+    );
+  });
 });
