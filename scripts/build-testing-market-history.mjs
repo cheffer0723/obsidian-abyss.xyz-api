@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 
 const inputDirectory = String(process.env.ENGINE_MARKET_DATA_DIR || "").trim();
 if (!inputDirectory) throw new Error("ENGINE_MARKET_DATA_DIR is required.");
@@ -35,7 +36,29 @@ for (const [symbol, kind] of assets) {
     bars,
   };
 }
+const json = `${JSON.stringify(output)}\n`;
 const target = path.resolve("data/testing-harness/market-history.json");
 fs.mkdirSync(path.dirname(target), { recursive: true });
-fs.writeFileSync(target, `${JSON.stringify(output)}\n`);
-console.log(JSON.stringify({ target, assets: Object.keys(output.assets).length, bytes: fs.statSync(target).size }));
+fs.writeFileSync(target, json);
+
+const compressed = zlib.gzipSync(Buffer.from(json), { level: 9 });
+const partsDir = path.resolve("data/testing-harness/market-history.parts");
+fs.rmSync(partsDir, { recursive: true, force: true });
+fs.mkdirSync(partsDir, { recursive: true });
+const chunk = 12_000;
+let partCount = 0;
+for (let offset = 0; offset < compressed.length; offset += chunk) {
+  const slice = compressed.subarray(offset, offset + chunk);
+  const stem = String(partCount).padStart(3, "0");
+  // Base64 text parts are git/MCP-friendly; loader prefers *.gz.part.b64 over binary *.gz.part.
+  fs.writeFileSync(path.join(partsDir, `${stem}.gz.part.b64`), slice.toString("base64"));
+  partCount += 1;
+}
+
+console.log(JSON.stringify({
+  target,
+  partsDir,
+  assets: Object.keys(output.assets).length,
+  bytes: fs.statSync(target).size,
+  partCount,
+}));
