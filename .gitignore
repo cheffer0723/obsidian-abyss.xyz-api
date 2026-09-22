@@ -16,3 +16,6 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Local monolithic harness snapshot (shipped as gzip parts under market-history.parts/)
+data/testing-harness/market-history.json
