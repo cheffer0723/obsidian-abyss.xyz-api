@@ -12,7 +12,7 @@ const assets = [
 const output = {
   generatedAt: new Date().toISOString(),
   purpose: "historical_testing_only",
-  source: "Recovered daily adjusted-close research files; frozen local snapshot",
+  source: "Daily adjusted-close research snapshot for historical harness testing only (not a live signal feed)",
   assets: {},
 };
 for (const [symbol, kind] of assets) {
