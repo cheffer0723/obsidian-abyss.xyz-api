@@ -22,23 +22,50 @@ function defaultDataDir(): string {
   return path.resolve(process.cwd(), "data/testing-harness");
 }
 
+function decodeBase64Parts(texts: string[]): Buffer {
+  return Buffer.concat(texts.map((text) => Buffer.from(text.replace(/\s+/g, ""), "base64")));
+}
+
 function loadFromParts(directory: string): TestingMarketHistory {
   const partsDir = path.join(directory, "market-history.parts");
   if (!fs.existsSync(partsDir)) {
     throw serviceError("Historical market data is not available.");
   }
-  // Prefer base64 text parts (git/MCP-friendly); fall back to raw binary .gz.part chunks.
-  const b64Parts = fs.readdirSync(partsDir).filter((name) => name.endsWith(".gz.part.b64")).sort();
+  const names = fs.readdirSync(partsDir);
+
+  // Prefer MCP-friendly base64 shards: NNN.gz.part.b64.SS
+  const shardNames = names.filter((name) => /\.gz\.part\.b64\.\d+$/.test(name)).sort();
   let compressed: Buffer;
-  if (b64Parts.length) {
-    compressed = Buffer.concat(
-      b64Parts.map((name) => Buffer.from(fs.readFileSync(path.join(partsDir, name), "utf8"), "base64")),
-    );
+  if (shardNames.length) {
+    const groups = new Map<string, string[]>();
+    for (const name of shardNames) {
+      const key = name.replace(/\.\d+$/, "");
+      const list = groups.get(key) || [];
+      list.push(name);
+      groups.set(key, list);
+    }
+    const texts: string[] = [];
+    for (const key of [...groups.keys()].sort()) {
+      const shards = (groups.get(key) || []).sort((a, b) => {
+        const ai = Number(a.slice(a.lastIndexOf(".") + 1));
+        const bi = Number(b.slice(b.lastIndexOf(".") + 1));
+        return ai - bi;
+      });
+      texts.push(shards.map((name) => fs.readFileSync(path.join(partsDir, name), "utf8")).join(""));
+    }
+    compressed = decodeBase64Parts(texts);
   } else {
-    const parts = fs.readdirSync(partsDir).filter((name) => name.endsWith(".gz.part")).sort();
-    if (!parts.length) throw serviceError("Historical market data is not available.");
-    compressed = Buffer.concat(parts.map((name) => fs.readFileSync(path.join(partsDir, name))));
+    // Prefer full base64 text parts; fall back to raw binary .gz.part chunks.
+    const b64Parts = names.filter((name) => name.endsWith(".gz.part.b64")).sort();
+    if (b64Parts.length) {
+      compressed = decodeBase64Parts(b64Parts.map((name) => fs.readFileSync(path.join(partsDir, name), "utf8")));
+    } else {
+      const parts = names.filter((name) => name.endsWith(".gz.part")).sort();
+      if (!parts.length) throw serviceError("Historical market data is not available.");
+      compressed = Buffer.concat(parts.map((name) => fs.readFileSync(path.join(partsDir, name))));
+    }
   }
+
   const parsed = JSON.parse(zlib.gunzipSync(compressed).toString("utf8")) as TestingMarketHistory;
   if (parsed?.purpose !== "historical_testing_only" || !parsed.assets || typeof parsed.assets !== "object") {
     throw serviceError("Historical market data failed validation.");
