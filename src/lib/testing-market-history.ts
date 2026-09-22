@@ -59,41 +59,45 @@ function loadShardMapFromPacks(directory: string): Map<string, string> | null {
   return shardMap.size ? shardMap : null;
 }
 
-function loadFromParts(directory: string): TestingMarketHistory {
-  const partsDir = path.join(directory, "market-history.parts");
-  const names = fs.existsSync(partsDir) ? fs.readdirSync(partsDir) : [];
-
-  // Prefer MCP-friendly base64 shards: NNN.gz.part.b64.SS
-  const shardNames = names.filter((name) => /\.gz\.part\.b64\.\d+$/.test(name)).sort();
-  let compressed: Buffer;
-  if (shardNames.length) {
-    const shardMap = new Map<string, string>();
-    for (const name of shardNames) {
-      shardMap.set(name, fs.readFileSync(path.join(partsDir, name), "utf8"));
-    }
-    compressed = assembleCompressedFromShardMap(shardMap);
-  } else {
-    const fromPacks = loadShardMapFromPacks(directory);
-    if (fromPacks) {
-      compressed = assembleCompressedFromShardMap(fromPacks);
-    } else {
-      // Prefer full base64 text parts; fall back to raw binary .gz.part chunks.
-      const b64Parts = names.filter((name) => name.endsWith(".gz.part.b64")).sort();
-      if (b64Parts.length) {
-        compressed = decodeBase64Parts(b64Parts.map((name) => fs.readFileSync(path.join(partsDir, name), "utf8")));
-      } else {
-        const parts = names.filter((name) => name.endsWith(".gz.part")).sort();
-        if (!parts.length) throw serviceError("Historical market data is not available.");
-        compressed = Buffer.concat(parts.map((name) => fs.readFileSync(path.join(partsDir, name))));
-      }
-    }
-  }
-
+function parseHistory(compressed: Buffer): TestingMarketHistory {
   const parsed = JSON.parse(zlib.gunzipSync(compressed).toString("utf8")) as TestingMarketHistory;
   if (parsed?.purpose !== "historical_testing_only" || !parsed.assets || typeof parsed.assets !== "object") {
     throw serviceError("Historical market data failed validation.");
   }
   return parsed;
+}
+
+function loadFromParts(directory: string): TestingMarketHistory {
+  const partsDir = path.join(directory, "market-history.parts");
+  const names = fs.existsSync(partsDir) ? fs.readdirSync(partsDir) : [];
+  const fromPacks = loadShardMapFromPacks(directory);
+
+  // Prefer MCP-friendly base64 shards: NNN.gz.part.b64.SS
+  const shardNames = names.filter((name) => /\.gz\.part\.b64\.\d+$/.test(name)).sort();
+  if (shardNames.length) {
+    try {
+      const shardMap = new Map<string, string>();
+      for (const name of shardNames) {
+        shardMap.set(name, fs.readFileSync(path.join(partsDir, name), "utf8"));
+      }
+      return parseHistory(assembleCompressedFromShardMap(shardMap));
+    } catch {
+      // Incomplete MCP uploads fall through to committed shard-packs.
+    }
+  }
+
+  if (fromPacks) {
+    return parseHistory(assembleCompressedFromShardMap(fromPacks));
+  }
+
+  // Prefer full base64 text parts; fall back to raw binary .gz.part chunks.
+  const b64Parts = names.filter((name) => name.endsWith(".gz.part.b64")).sort();
+  if (b64Parts.length) {
+    return parseHistory(decodeBase64Parts(b64Parts.map((name) => fs.readFileSync(path.join(partsDir, name), "utf8"))));
+  }
+  const parts = names.filter((name) => name.endsWith(".gz.part")).sort();
+  if (!parts.length) throw serviceError("Historical market data is not available.");
+  return parseHistory(Buffer.concat(parts.map((name) => fs.readFileSync(path.join(partsDir, name)))));
 }
 
 function loadFromJsonFile(filename: string): TestingMarketHistory {
