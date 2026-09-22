@@ -12,7 +12,8 @@
     "test:harness": "node scripts/run-testing-harness-tests.mjs",
     "build:harness-data": "node scripts/build-testing-market-history.mjs",
     "refresh:harness-data": "node scripts/refresh-testing-market-history.mjs",
-    "install:harness-shards": "node scripts/install-harness-shards.mjs"
+    "install:harness-shards": "node scripts/install-harness-shards.mjs",
+    "apply:harness-shards": "node scripts/apply-harness-shard-packs.mjs"
   },
   "engines": {
     "node": ">=20"
