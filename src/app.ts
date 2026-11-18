@@ -90,7 +90,14 @@ app.get("/.well-known/jwks.json", (_req, res) => {
   }
 });
 
+// Real API versioning: /api/v1 is a genuine alias for the current, unversioned /api paths --
+// not a separate, unmaintained fork. Mounting the SAME router instances at both prefixes is
+// what makes that true: there is no second copy of the auth checks to drift out of sync, so
+// an old integration still pinned to /api/v1 gets the exact same session/token enforcement as
+// /api. When a real v2 is eventually needed, /api/v1 stays as-is and only the new prefix
+// changes behavior.
 app.use("/api", authRouter);
+app.use("/api/v1", authRouter);
 
 // Agentic access (x402): gates only MACHINE_ROUTE_PATH when X402_ENABLED=true.
 // Off/unconfigured => middleware is null and the route stays free. Human endpoints are never gated.
@@ -108,6 +115,7 @@ if (x402Middleware) {
 }
 
 app.use("/api", router);
+app.use("/api/v1", router);
 
 if (process.env.NODE_ENV === "production") {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
