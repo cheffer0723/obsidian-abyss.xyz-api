@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   claimLoginIntent,
+  completeTwoFactorLogin,
   currentUser,
   databaseReady,
   entitlementFor,
@@ -26,6 +27,10 @@ const claimSchema = z.object({
 const testLoginSchema = z.object({
   email: z.string().trim().email().max(320),
   password: z.string().min(1).max(200),
+});
+const twoFactorVerifySchema = z.object({
+  pendingToken: z.string().min(20).max(200),
+  code: z.string().trim().regex(/^\d{6}$/),
 });
 
 function appUrl(): string {
@@ -110,10 +115,38 @@ router.post("/auth/test-login", async (req, res, next) => {
     const result = await testPasswordLogin(email, password, sourceIp, res);
     if (result === "ok") { res.json({ ok: true }); return; }
     if (result === "locked") { res.status(429).json({ ok: false, error: "Too many attempts. Try again later." }); return; }
+    if (typeof result === "object" && result.needsTwoFactor) { res.json({ ok: true, needsTwoFactor: true, pendingToken: result.pendingToken }); return; }
     res.status(401).json({ ok: false, error: "Invalid email or password." });
   } catch (e) {
     if (e instanceof z.ZodError) {
       res.status(400).json({ ok: false, error: "Invalid sign-in." });
+      return;
+    }
+    next(e);
+  }
+});
+
+// The second step of sign-in for any account with 2FA enabled: a valid pendingToken (from
+// test-login, or from /auth/claim's "needs-2fa" status) plus a real 6-digit code creates the
+// session. A wrong or already-used code is refused the same way either way (401), never
+// distinguishing "wrong code" from "that code was already used" -- see otp-reuse's own proof
+// rule for why that distinction must not leak.
+router.post("/auth/2fa/verify", async (req, res, next) => {
+  try {
+    if (!databaseReady()) {
+      res.status(503).json({ ok: false, error: "Authentication is temporarily unavailable." });
+      return;
+    }
+    const { pendingToken, code } = twoFactorVerifySchema.parse(req.body);
+    const ok = await completeTwoFactorLogin(pendingToken, code, res);
+    if (!ok) {
+      res.status(401).json({ ok: false, error: "That code is invalid or has expired." });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "Enter the 6-digit code." });
       return;
     }
     next(e);

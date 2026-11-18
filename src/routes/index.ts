@@ -14,6 +14,7 @@ import apiTokensRouter from "./api-tokens.js";
 import oauthRouter from "./oauth.js";
 import activityRouter from "./activity.js";
 import graphqlRouter from "./graphql.js";
+import twoFactorRouter from "./two-factor.js";
 
 const router = Router();
 
@@ -32,5 +33,6 @@ router.use(apiTokensRouter);
 router.use(oauthRouter);
 router.use(activityRouter);
 router.use(graphqlRouter);
+router.use(twoFactorRouter);
 
 export default router;
