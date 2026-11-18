@@ -1,9 +1,12 @@
 import { Router } from "express";
 import { z } from "zod";
-import { currentUser, databaseReady, listBetaFeedback, submitBetaFeedback } from "../lib/account.js";
+import { currentUser, databaseReady, listBetaFeedback, resolveBetaFeedback, submitBetaFeedback } from "../lib/account.js";
 import { requireAdmin } from "../lib/access.js";
 
 const router = Router();
+
+const resolveBody = z.object({ resolved: z.boolean() });
+const uuidSchema = z.string().uuid();
 
 const feedbackBody = z.object({
   category: z.enum(["comment", "concern", "bug", "idea"]),
@@ -70,6 +73,29 @@ router.get("/admin/feedback", requireAdmin, async (req, res, next) => {
     const limit = Number(req.query.limit || 50);
     res.json({ ok: true, feedback: await listBetaFeedback(Number.isFinite(limit) ? limit : 50) });
   } catch (error) {
+    next(error);
+  }
+});
+
+// The one admin WRITE action in this app: mark a piece of feedback resolved or not, after
+// triage. requireAdmin is the only check -- it's the same guard the read route above uses,
+// so this proves whether a normal signed-in account can also reach a real admin ACTION, not
+// just a read.
+router.patch("/admin/feedback/:id", requireAdmin, async (req, res, next) => {
+  try {
+    const id = uuidSchema.parse(req.params.id);
+    const { resolved } = resolveBody.parse(req.body);
+    const row = await resolveBetaFeedback(id, resolved);
+    if (!row) {
+      res.status(404).json({ ok: false, error: "Not found." });
+      return;
+    }
+    res.json({ ok: true, feedback: row });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "That request could not be read." });
+      return;
+    }
     next(error);
   }
 });
