@@ -9,6 +9,7 @@ import {
   listHarnessRunsByUser,
   renameHarnessRun,
 } from "../lib/account.js";
+import { renderReportPdf } from "../lib/reports.js";
 
 const router = Router();
 
@@ -126,6 +127,39 @@ router.get("/harness/runs/:id", async (req, res, next) => {
       return;
     }
     res.json({ ok: true, run: asRun(run) });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "That is not a valid run id." });
+      return;
+    }
+    next(error);
+  }
+});
+
+// A real export a user actually wants: their own run as a PDF, suitable for keeping or sharing
+// outside the app. Same ownership check as the read above; the PDF is rendered from a fixed
+// template with the run's own fields as data (see src/lib/reports.ts for why that is safe).
+router.get("/harness/runs/:id/report.pdf", async (req, res, next) => {
+  try {
+    if (!databaseReady()) {
+      res.status(503).json({ ok: false, error: "Saved runs are temporarily unavailable." });
+      return;
+    }
+    const user = await currentUser(req);
+    if (!user) {
+      res.status(401).json({ ok: false, error: "Sign-in is required." });
+      return;
+    }
+    const id = uuidSchema.parse(req.params.id);
+    const run = await getHarnessRun(id);
+    if (!run || run.userId !== user.id) {
+      res.status(404).json({ ok: false, error: "Not found." });
+      return;
+    }
+    const pdf = await renderReportPdf({ id: run.id, name: run.name, createdAt: run.createdAt });
+    res.setHeader("content-type", "application/pdf");
+    res.setHeader("content-disposition", `attachment; filename="backtest-report-${run.id}.pdf"`);
+    res.send(pdf);
   } catch (error) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ ok: false, error: "That is not a valid run id." });
