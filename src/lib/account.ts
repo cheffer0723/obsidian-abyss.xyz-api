@@ -388,10 +388,11 @@ export async function logout(req: Request, res: Response): Promise<void> {
 // Each pair only ever signs in as its own exact email — every other address is refused the same
 // way an unknown account is refused everywhere else in this file. A password is never stored in
 // the repo or in cleartext in the environment, only its SHA-256 hash; comparison is constant-
-// time. A small in-memory lockout (5 attempts per 15 minutes per source IP, then refused for 15
-// minutes) is the same shape a real password login should have, so testing it proves something
-// real. Never wired into the public login page — API-only, and 404s entirely when neither pair
-// is configured.
+// time. A small in-memory lockout (5 attempts per 15 minutes PER EMAIL ATTEMPTED, then refused
+// for 15 minutes) is the same shape a real password login should have, so testing it proves
+// something real -- keyed by the account, never by anything the caller sends (a claimed source
+// address is not a lock at all, since the caller picks it). Never wired into the public login
+// page — API-only, and 404s entirely when neither pair is configured.
 const testLoginAttempts = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const TEST_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const TEST_LOGIN_MAX_ATTEMPTS = 5;
@@ -421,15 +422,21 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured";
 
 export async function testPasswordLogin(emailInput: string, password: string, sourceIp: string, res: Response): Promise<TestLoginResult> {
+  void sourceIp; // kept in the signature for the caller's log line; never used for the lock --
+  // a caller picks their own X-Forwarded-For, so locking by it is no lock at all (found by
+  // ScamShade's authorized rate-limit probe, 2026-11-18: 12 wrong tries, each claiming a
+  // different address, were never locked). The lock is keyed by the EMAIL being attempted
+  // instead -- each configured account gets its own 5-tries-per-15-minutes limit, and nothing
+  // the caller sends can pick which bucket a failure lands in.
   const slots = testLoginSlots();
   if (!slots.length) return "not-configured";
   const now = Date.now();
-  const key = sourceIp || "unknown";
+  const email = normalizeEmail(emailInput);
+  const key = email || "unknown";
   const entry = testLoginAttempts.get(key);
   if (entry && entry.lockedUntil > now) return "locked";
   if (entry && now - entry.firstAt > TEST_LOGIN_WINDOW_MS) testLoginAttempts.delete(key);
 
-  const email = normalizeEmail(emailInput);
   const matchedSlot = slots.find((s) => s.email === email);
   const passwordHash = hash(password);
   const ok = Boolean(matchedSlot) && timingSafeEqualHex(passwordHash, matchedSlot!.hash);
