@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { Pool } from "pg";
 import nodemailer from "nodemailer";
 import jwt from "jsonwebtoken";
+import { Secret, TOTP } from "otpauth";
 import type { Request, Response } from "express";
 import { logger } from "./logger.js";
 
@@ -91,6 +92,18 @@ async function ensureSchema(): Promise<void> {
       used_at timestamptz
     );
     CREATE INDEX IF NOT EXISTS abyss_oauth_clients_user_id_idx ON abyss_oauth_clients (user_id);
+    CREATE TABLE IF NOT EXISTS abyss_two_factor (
+      user_id uuid PRIMARY KEY REFERENCES abyss_users(id) ON DELETE CASCADE,
+      secret text NOT NULL,
+      confirmed_at timestamptz,
+      last_used_counter bigint,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS abyss_pending_logins (
+      token_hash text PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      expires_at timestamptz NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS abyss_harness_runs_user_id_idx ON abyss_harness_runs (user_id);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
@@ -240,7 +253,10 @@ export async function verifyMagicLink(token: string, res: Response): Promise<boo
   await ensureSchema();
   const result = await pool!.query<{ user_id: string }>(`UPDATE abyss_auth_tokens SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() RETURNING user_id`, [hash(token)]);
   if (!result.rowCount) return false;
-  await createSession(result.rows[0].user_id, res);
+  // This confirming tab's own session is never relied on further (the waiting browser gets the
+  // session that matters via claimLoginIntent below), so when 2FA is on this simply does not
+  // issue one here -- nothing is lost, and no unprotected session is created either.
+  await startSessionOrRequireCode(result.rows[0].user_id, res);
   void recordMetricEvent({ eventType: "magic_link_verified", outcome: "success" });
   await pool!.query(
     `UPDATE abyss_login_intents
@@ -254,6 +270,7 @@ export async function verifyMagicLink(token: string, res: Response): Promise<boo
 export type LoginClaimResult =
   | { status: "pending"; returnTo: string }
   | { status: "claimed"; returnTo: string }
+  | { status: "needs-2fa"; returnTo: string; pendingToken: string }
   | { status: "expired"; returnTo: string }
   | { status: "invalid" };
 
@@ -293,7 +310,8 @@ export async function claimLoginIntent(intentId: string, waiterSecret: string, r
     [intentId, hash(waiterSecret)],
   );
   if (!updated.rowCount) return { status: "pending", returnTo: row.return_to };
-  await createSession(updated.rows[0].user_id, res);
+  const sessionResult = await startSessionOrRequireCode(updated.rows[0].user_id, res);
+  if (sessionResult.ok === "pending") return { status: "needs-2fa", returnTo: updated.rows[0].return_to, pendingToken: sessionResult.pendingToken };
   return { status: "claimed", returnTo: updated.rows[0].return_to };
 }
 
@@ -432,6 +450,108 @@ export async function exchangeAuthorizationCode(code: string, clientId: string, 
   const created = await createApiToken(matched.user_id, `oauth:${clientId}`);
   const expiresIn = Math.round((new Date(created.expiresAt).getTime() - Date.now()) / 1000);
   return { ok: true, accessToken: created.token, expiresIn };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-factor sign-in (TOTP, RFC 6238) -- real, authenticator-app-compatible (Google
+// Authenticator, Authy, 1Password, etc: standard 6-digit codes, SHA1, 30s period). Gates
+// EVERY path that would otherwise issue a session (magic-link verify, the waiting-browser
+// claim, and the test-only password login below) through the same pending-login step, so
+// enabling 2FA protects the account regardless of which sign-in method is used.
+const totpFor = (secret: string, email: string) => new TOTP({ issuer: "Obsidian Abyss", label: email, secret: Secret.fromBase32(secret), algorithm: "SHA1", digits: 6, period: 30 });
+
+export async function beginTwoFactorEnrollment(userId: string, email: string): Promise<{ secret: string; otpauthUrl: string }> {
+  await ensureSchema();
+  const secret = new Secret({ size: 20 }).base32;
+  // Unconfirmed until confirmTwoFactorEnrollment verifies a real code -- a secret alone, never
+  // proven to work with the user's own authenticator app, must not be able to lock them out.
+  await pool!.query(
+    `INSERT INTO abyss_two_factor (user_id,secret) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET secret=EXCLUDED.secret, confirmed_at=NULL, last_used_counter=NULL`,
+    [userId, secret],
+  );
+  return { secret, otpauthUrl: totpFor(secret, email).toString() };
+}
+
+async function twoFactorRow(userId: string): Promise<{ secret: string; confirmed: boolean; lastUsedCounter: number | null } | null> {
+  await ensureSchema();
+  const r = await pool!.query<{ secret: string; confirmed_at: Date | null; last_used_counter: string | null }>(
+    `SELECT secret, confirmed_at, last_used_counter FROM abyss_two_factor WHERE user_id=$1`,
+    [userId],
+  );
+  const row = r.rows[0];
+  return row ? { secret: row.secret, confirmed: Boolean(row.confirmed_at), lastUsedCounter: row.last_used_counter ? Number(row.last_used_counter) : null } : null;
+}
+
+export async function isTwoFactorEnabled(userId: string): Promise<boolean> {
+  const row = await twoFactorRow(userId);
+  return Boolean(row?.confirmed);
+}
+
+// The one real defense against otp-reuse: every accepted code's absolute time-step is recorded,
+// and a code is refused if its step is not STRICTLY AFTER the last accepted one -- so the exact
+// same code (or an older one inside the drift window) can never be accepted twice, even though
+// a 30s window naturally allows some clock drift.
+async function verifyAndConsumeCode(userId: string, secret: string, email: string, code: string, lastUsedCounter: number | null): Promise<boolean> {
+  const totp = totpFor(secret, email);
+  const delta = totp.validate({ token: code, window: 1 });
+  if (delta === null) return false;
+  const counter = Math.floor(Date.now() / 1000 / totp.period) + delta;
+  if (lastUsedCounter !== null && counter <= lastUsedCounter) return false;
+  await pool!.query(`UPDATE abyss_two_factor SET last_used_counter=$2 WHERE user_id=$1`, [userId, counter]);
+  return true;
+}
+
+export async function confirmTwoFactorEnrollment(userId: string, email: string, code: string): Promise<boolean> {
+  const row = await twoFactorRow(userId);
+  if (!row) return false;
+  const ok = await verifyAndConsumeCode(userId, row.secret, email, code, row.lastUsedCounter);
+  if (ok) await pool!.query(`UPDATE abyss_two_factor SET confirmed_at=now() WHERE user_id=$1`, [userId]);
+  return ok;
+}
+
+// Used to re-prove possession of the authenticator for a sensitive action (disabling 2FA)
+// without that action itself being a sign-in -- same replay protection as everywhere else.
+export async function verifyCurrentTwoFactorCode(userId: string, email: string, code: string): Promise<boolean> {
+  const row = await twoFactorRow(userId);
+  if (!row || !row.confirmed) return false;
+  return verifyAndConsumeCode(userId, row.secret, email, code, row.lastUsedCounter);
+}
+
+export async function disableTwoFactor(userId: string): Promise<void> {
+  await ensureSchema();
+  await pool!.query(`DELETE FROM abyss_two_factor WHERE user_id=$1`, [userId]);
+}
+
+export type SessionResult = { ok: true } | { ok: "pending"; pendingToken: string };
+
+// Called everywhere a session would normally be created outright. If 2FA isn't enabled,
+// behavior is identical to before (immediate session). If it is, a short-lived pending-login
+// record stands in for the session until completeTwoFactorLogin verifies a real code.
+async function startSessionOrRequireCode(userId: string, res: Response): Promise<SessionResult> {
+  if (!(await isTwoFactorEnabled(userId))) {
+    await createSession(userId, res);
+    return { ok: true };
+  }
+  await ensureSchema();
+  const pendingToken = randomToken();
+  await pool!.query(`INSERT INTO abyss_pending_logins (token_hash,user_id,expires_at) VALUES ($1,$2,now()+interval '5 minutes')`, [hash(pendingToken), userId]);
+  return { ok: "pending", pendingToken };
+}
+
+export async function completeTwoFactorLogin(pendingToken: string, code: string, res: Response): Promise<boolean> {
+  await ensureSchema();
+  const pending = await pool!.query<{ user_id: string }>(
+    `DELETE FROM abyss_pending_logins WHERE token_hash=$1 AND expires_at>now() RETURNING user_id`,
+    [hash(pendingToken)],
+  );
+  const userId = pending.rows[0]?.user_id;
+  if (!userId) return false;
+  const user = await pool!.query<{ email: string }>(`SELECT email FROM abyss_users WHERE id=$1`, [userId]);
+  const row = await twoFactorRow(userId);
+  if (!row || !row.confirmed || !user.rows[0]) return false;
+  const ok = await verifyAndConsumeCode(userId, row.secret, user.rows[0].email, code, row.lastUsedCounter);
+  if (ok) await createSession(userId, res);
+  return ok;
 }
 
 export async function currentUser(req: Request): Promise<{ id: string; email: string } | null> {
@@ -585,7 +705,7 @@ function timingSafeEqualHex(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured";
+export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured" | { needsTwoFactor: true; pendingToken: string };
 
 export async function testPasswordLogin(emailInput: string, password: string, sourceIp: string, res: Response): Promise<TestLoginResult> {
   void sourceIp; // kept in the signature for the caller's log line; never used for the lock --
@@ -619,7 +739,8 @@ export async function testPasswordLogin(emailInput: string, password: string, so
   testLoginAttempts.delete(key);
   await ensureSchema();
   const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
-  await createSession(user.rows[0].id, res);
+  const sessionResult = await startSessionOrRequireCode(user.rows[0].id, res);
+  if (sessionResult.ok === "pending") return { needsTwoFactor: true, pendingToken: sessionResult.pendingToken };
   return "ok";
 }
 
