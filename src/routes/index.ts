@@ -13,6 +13,7 @@ import harnessRunsRouter from "./harness-runs.js";
 import apiTokensRouter from "./api-tokens.js";
 import oauthRouter from "./oauth.js";
 import activityRouter from "./activity.js";
+import graphqlRouter from "./graphql.js";
 
 const router = Router();
 
@@ -30,5 +31,6 @@ router.use(harnessRunsRouter);
 router.use(apiTokensRouter);
 router.use(oauthRouter);
 router.use(activityRouter);
+router.use(graphqlRouter);
 
 export default router;
