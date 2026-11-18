@@ -37,6 +37,7 @@ async function ensureSchema(): Promise<void> {
       user_agent text,
       user_id uuid REFERENCES abyss_users(id) ON DELETE SET NULL
     );
+    ALTER TABLE abyss_beta_feedback ADD COLUMN IF NOT EXISTS resolved boolean NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS abyss_login_intents (
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
@@ -558,6 +559,7 @@ export type BetaFeedbackRow = {
   message: string;
   contactEmail: string | null;
   pagePath: string | null;
+  resolved: boolean;
 };
 
 export async function submitBetaFeedback(input: BetaFeedbackInput): Promise<{ id: string }> {
@@ -598,8 +600,9 @@ export async function listBetaFeedback(limit = 50): Promise<BetaFeedbackRow[]> {
     message: string;
     contact_email: string | null;
     page_path: string | null;
+    resolved: boolean;
   }>(
-    `SELECT id, created_at, category, message, contact_email, page_path
+    `SELECT id, created_at, category, message, contact_email, page_path, resolved
      FROM abyss_beta_feedback
      ORDER BY created_at DESC
      LIMIT $1`,
@@ -612,7 +615,39 @@ export async function listBetaFeedback(limit = 50): Promise<BetaFeedbackRow[]> {
     message: row.message,
     contactEmail: row.contact_email,
     pagePath: row.page_path,
+    resolved: row.resolved,
   }));
+}
+
+// Admin-only, by convention of every caller (see the route) -- this function itself does not
+// check who is calling, the same as every other write in this file; the ROUTE is what enforces
+// admin-only, same pattern as requireAdmin elsewhere.
+export async function resolveBetaFeedback(id: string, resolved: boolean): Promise<BetaFeedbackRow | null> {
+  await ensureSchema();
+  const result = await pool!.query<{
+    id: string;
+    created_at: Date;
+    category: BetaFeedbackCategory;
+    message: string;
+    contact_email: string | null;
+    page_path: string | null;
+    resolved: boolean;
+  }>(
+    `UPDATE abyss_beta_feedback SET resolved=$2 WHERE id=$1
+     RETURNING id, created_at, category, message, contact_email, page_path, resolved`,
+    [id, resolved],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    createdAt: row.created_at.toISOString(),
+    category: row.category,
+    message: row.message,
+    contactEmail: row.contact_email,
+    pagePath: row.page_path,
+    resolved: row.resolved,
+  };
 }
 
 async function notifyFeedbackSubmitted(input: {
