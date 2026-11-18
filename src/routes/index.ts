@@ -12,6 +12,7 @@ import profileRouter from "./profile.js";
 import harnessRunsRouter from "./harness-runs.js";
 import apiTokensRouter from "./api-tokens.js";
 import oauthRouter from "./oauth.js";
+import activityRouter from "./activity.js";
 
 const router = Router();
 
@@ -28,5 +29,6 @@ router.use(profileRouter);
 router.use(harnessRunsRouter);
 router.use(apiTokensRouter);
 router.use(oauthRouter);
+router.use(activityRouter);
 
 export default router;
