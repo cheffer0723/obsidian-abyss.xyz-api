@@ -13,6 +13,7 @@ async function ensureSchema(): Promise<void> {
   if (!pool) throw new Error("Database is not configured.");
   if (!schemaReady) schemaReady = pool.query(`
     CREATE TABLE IF NOT EXISTS abyss_users (id uuid PRIMARY KEY, email text UNIQUE NOT NULL, stripe_customer_id text UNIQUE, created_at timestamptz NOT NULL DEFAULT now());
+    ALTER TABLE abyss_users ADD COLUMN IF NOT EXISTS display_name text;
     CREATE TABLE IF NOT EXISTS abyss_auth_tokens (token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL, used_at timestamptz);
     CREATE TABLE IF NOT EXISTS abyss_sessions (token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS abyss_entitlements (user_id uuid PRIMARY KEY REFERENCES abyss_users(id) ON DELETE CASCADE, stripe_subscription_id text UNIQUE NOT NULL, status text NOT NULL, current_period_end timestamptz, updated_at timestamptz NOT NULL DEFAULT now());
@@ -192,6 +193,31 @@ export async function currentUser(req: Request): Promise<{ id: string; email: st
   if (!token) return null;
   const result = await pool!.query<{ id: string; email: string }>(`SELECT u.id,u.email FROM abyss_sessions s JOIN abyss_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`, [hash(token)]);
   return result.rows[0] || null;
+}
+
+export async function getProfile(userId: string): Promise<{ id: string; email: string; displayName: string | null } | null> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; email: string; display_name: string | null }>(
+    `SELECT id, email, display_name FROM abyss_users WHERE id=$1`,
+    [userId],
+  );
+  const row = result.rows[0];
+  return row ? { id: row.id, email: row.email, displayName: row.display_name } : null;
+}
+
+// The only way a signed-in account can change its own record, and it accepts exactly one
+// field. This is what keeps it safe from mass assignment: a role, plan, or admin flag sent
+// alongside displayName in the same request is simply never read anywhere in this function —
+// not stripped, not checked, just never looked at. Real feature (an account's display name)
+// doubling as the fixture ScamShade's authorized mass-assignment probe proves this against.
+export async function setDisplayName(userId: string, displayName: string): Promise<{ id: string; email: string; displayName: string | null }> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; email: string; display_name: string | null }>(
+    `UPDATE abyss_users SET display_name=$2 WHERE id=$1 RETURNING id, email, display_name`,
+    [userId, displayName],
+  );
+  const row = result.rows[0];
+  return { id: row.id, email: row.email, displayName: row.display_name };
 }
 
 export async function logout(req: Request, res: Response): Promise<void> {

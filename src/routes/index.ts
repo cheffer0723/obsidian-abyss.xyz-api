@@ -8,6 +8,7 @@ import billingRouter from "./billing.js";
 import testingHarnessRouter from "./testing-harness.js";
 import adminRouter from "./admin.js";
 import feedbackRouter from "./feedback.js";
+import profileRouter from "./profile.js";
 
 const router = Router();
 
@@ -20,5 +21,6 @@ router.use(billingRouter);
 router.use(testingHarnessRouter);
 router.use(adminRouter);
 router.use(feedbackRouter);
+router.use(profileRouter);
 
 export default router;
