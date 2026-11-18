@@ -64,6 +64,11 @@ function normalizeEmail(email: string): string { return email.trim().toLowerCase
 
 export function isAdminEmail(email: string): boolean {
   const normalized = normalizeEmail(email);
+  // The test-only admin account (TEST_ADMIN_EMAIL, below) is admin on its own, kept entirely
+  // separate from ADMIN_EMAILS on purpose: this never reads or writes that list, so setting up
+  // a test admin can never touch — or accidentally clear — a real admin address.
+  const testAdmin = process.env.TEST_ADMIN_EMAIL ? normalizeEmail(process.env.TEST_ADMIN_EMAIL) : null;
+  if (testAdmin && normalized === testAdmin) return true;
   return (process.env.ADMIN_EMAILS || "")
     .split(",")
     .map(normalizeEmail)
@@ -230,23 +235,42 @@ export async function logout(req: Request, res: Response): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// TEST-ONLY password sign-in. Exists purely so our own authorized security testing (ScamShade)
-// has a synchronous login to exercise brute-force/lockout, logout and session-fixation checks
-// against the real session system, without needing a real customer's inbox for every attempt.
+// TEST-ONLY password sign-ins. Exist purely so our own authorized security testing (ScamShade)
+// has a synchronous login to exercise brute-force/lockout, logout, session-fixation and (for
+// the second, admin-flagged pair) access-control checks against the real session system,
+// without needing a real customer's inbox for every attempt.
 //
-// Off by default: both TEST_LOGIN_EMAIL and TEST_LOGIN_PASSWORD_HASH must be set, and it only
-// ever works for that ONE exact email — every other address is refused the same way an unknown
-// account is refused everywhere else in this file. The password is never stored in the repo or
-// in cleartext in the environment, only its SHA-256 hash; comparison is constant-time. A small
-// in-memory lockout (5 attempts per 15 minutes per source IP, then refused for 15 minutes) is
-// the same shape a real password login should have, so testing it proves something real.
-// Never wired into the public login page — API-only, and 404s entirely when unconfigured.
+// Two independent pairs, each off by default unless BOTH its own env vars are set:
+//   TEST_LOGIN_EMAIL / TEST_LOGIN_PASSWORD_HASH  — an ordinary, non-admin account.
+//   TEST_ADMIN_EMAIL / TEST_ADMIN_PASSWORD_HASH  — a SEPARATE account that isAdminEmail() (above)
+//     treats as admin on its own, so access-control tests (BOLA, BFLA, batch-IDOR, write-IDOR)
+//     have a real privileged identity to compare the ordinary one against — without this ever
+//     reading or writing ADMIN_EMAILS.
+//
+// Each pair only ever signs in as its own exact email — every other address is refused the same
+// way an unknown account is refused everywhere else in this file. A password is never stored in
+// the repo or in cleartext in the environment, only its SHA-256 hash; comparison is constant-
+// time. A small in-memory lockout (5 attempts per 15 minutes per source IP, then refused for 15
+// minutes) is the same shape a real password login should have, so testing it proves something
+// real. Never wired into the public login page — API-only, and 404s entirely when neither pair
+// is configured.
 const testLoginAttempts = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const TEST_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const TEST_LOGIN_MAX_ATTEMPTS = 5;
 
+function testLoginSlots(): { email: string; hash: string }[] {
+  const slots: { email: string; hash: string }[] = [];
+  if (process.env.TEST_LOGIN_EMAIL && process.env.TEST_LOGIN_PASSWORD_HASH) {
+    slots.push({ email: normalizeEmail(process.env.TEST_LOGIN_EMAIL), hash: process.env.TEST_LOGIN_PASSWORD_HASH.trim().toLowerCase() });
+  }
+  if (process.env.TEST_ADMIN_EMAIL && process.env.TEST_ADMIN_PASSWORD_HASH) {
+    slots.push({ email: normalizeEmail(process.env.TEST_ADMIN_EMAIL), hash: process.env.TEST_ADMIN_PASSWORD_HASH.trim().toLowerCase() });
+  }
+  return slots;
+}
+
 export function testLoginConfigured(): boolean {
-  return Boolean(process.env.TEST_LOGIN_EMAIL && process.env.TEST_LOGIN_PASSWORD_HASH);
+  return testLoginSlots().length > 0;
 }
 
 function timingSafeEqualHex(a: string, b: string): boolean {
@@ -259,7 +283,8 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured";
 
 export async function testPasswordLogin(emailInput: string, password: string, sourceIp: string, res: Response): Promise<TestLoginResult> {
-  if (!testLoginConfigured()) return "not-configured";
+  const slots = testLoginSlots();
+  if (!slots.length) return "not-configured";
   const now = Date.now();
   const key = sourceIp || "unknown";
   const entry = testLoginAttempts.get(key);
@@ -267,10 +292,9 @@ export async function testPasswordLogin(emailInput: string, password: string, so
   if (entry && now - entry.firstAt > TEST_LOGIN_WINDOW_MS) testLoginAttempts.delete(key);
 
   const email = normalizeEmail(emailInput);
-  const expectedEmail = normalizeEmail(process.env.TEST_LOGIN_EMAIL!);
+  const matchedSlot = slots.find((s) => s.email === email);
   const passwordHash = hash(password);
-  const expectedHash = process.env.TEST_LOGIN_PASSWORD_HASH!.toLowerCase();
-  const ok = email === expectedEmail && timingSafeEqualHex(passwordHash, expectedHash);
+  const ok = Boolean(matchedSlot) && timingSafeEqualHex(passwordHash, matchedSlot!.hash);
 
   if (!ok) {
     const current = testLoginAttempts.get(key) || { count: 0, firstAt: now, lockedUntil: 0 };
