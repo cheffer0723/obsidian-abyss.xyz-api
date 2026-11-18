@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { Pool } from "pg";
 import nodemailer from "nodemailer";
+import jwt from "jsonwebtoken";
 import type { Request, Response } from "express";
 import { logger } from "./logger.js";
 
@@ -64,6 +65,15 @@ async function ensureSchema(): Promise<void> {
       name text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS abyss_api_tokens (
+      jti uuid PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      revoked_at timestamptz
+    );
+    CREATE INDEX IF NOT EXISTS abyss_api_tokens_user_id_idx ON abyss_api_tokens (user_id);
     CREATE INDEX IF NOT EXISTS abyss_harness_runs_user_id_idx ON abyss_harness_runs (user_id);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
@@ -270,12 +280,87 @@ export async function claimLoginIntent(intentId: string, waiterSecret: string, r
   return { status: "claimed", returnTo: updated.rows[0].return_to };
 }
 
+// ---------------------------------------------------------------------------------------------
+// API access tokens: a signed-in account can mint a token to call this API from its own
+// scripts, instead of carrying its browser session cookie. RS256-signed JWTs, verified against
+// ONE fixed public key read from the environment (API_TOKEN_PUBLIC_KEY) -- there is no "kid"-
+// or "jwk"-based key lookup anywhere in this file, by construction, so there is no key-selection
+// surface for a token to manipulate. The algorithm allow-list below is passed explicitly on every
+// verify; jsonwebtoken never falls back to "alg: none" or to an HMAC algorithm reusing the public
+// key as a shared secret, because we never give it the option to choose.
+function apiTokenPublicKey(): string | null { return process.env.API_TOKEN_PUBLIC_KEY || null; }
+function apiTokenPrivateKey(): string | null { return process.env.API_TOKEN_PRIVATE_KEY || null; }
+export function apiTokensConfigured(): boolean { return Boolean(apiTokenPublicKey() && apiTokenPrivateKey()); }
+
+export async function createApiToken(userId: string, name: string): Promise<{ jti: string; token: string; expiresAt: string }> {
+  await ensureSchema();
+  const privateKey = apiTokenPrivateKey();
+  if (!privateKey) throw new Error("API tokens are not configured.");
+  const jti = crypto.randomUUID();
+  const expiresInSeconds = 90 * 24 * 60 * 60; // 90 days
+  const token = jwt.sign({ sub: userId }, privateKey, {
+    algorithm: "RS256",
+    keyid: process.env.API_TOKEN_KID || undefined,
+    jwtid: jti,
+    expiresIn: expiresInSeconds,
+  });
+  const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+  await pool!.query(`INSERT INTO abyss_api_tokens (jti,user_id,name,expires_at) VALUES ($1,$2,$3,$4)`, [jti, userId, name, expiresAt]);
+  return { jti, token, expiresAt: expiresAt.toISOString() };
+}
+
+export type ApiTokenRow = { jti: string; name: string; createdAt: string; expiresAt: string; revokedAt: string | null };
+
+export async function listApiTokens(userId: string): Promise<ApiTokenRow[]> {
+  await ensureSchema();
+  const rows = await pool!.query<{ jti: string; name: string; created_at: Date; expires_at: Date; revoked_at: Date | null }>(
+    `SELECT jti,name,created_at,expires_at,revoked_at FROM abyss_api_tokens WHERE user_id=$1 ORDER BY created_at DESC`,
+    [userId],
+  );
+  return rows.rows.map((r) => ({ jti: r.jti, name: r.name, createdAt: r.created_at.toISOString(), expiresAt: r.expires_at.toISOString(), revokedAt: r.revoked_at ? r.revoked_at.toISOString() : null }));
+}
+
+// Ownership-checked the same way every other write in this file is: fetch the row, compare its
+// user_id to the caller, act only on a match.
+export async function revokeApiToken(userId: string, jti: string): Promise<boolean> {
+  await ensureSchema();
+  const result = await pool!.query(`UPDATE abyss_api_tokens SET revoked_at=now() WHERE jti=$1 AND user_id=$2 AND revoked_at IS NULL`, [jti, userId]);
+  return (result.rowCount || 0) > 0;
+}
+
+async function userFromApiToken(authorizationHeader: string | undefined): Promise<{ id: string; email: string } | null> {
+  if (!authorizationHeader) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(authorizationHeader.trim());
+  if (!match) return null;
+  const publicKey = apiTokenPublicKey();
+  if (!publicKey) return null;
+  let payload: jwt.JwtPayload;
+  try {
+    // algorithms is an explicit allow-list: a token claiming alg:none, or any HMAC algorithm
+    // (which would let an attacker sign with this very public key as if it were a shared
+    // secret), is rejected before anything else runs.
+    const decoded = jwt.verify(match[1], publicKey, { algorithms: ["RS256"] });
+    if (typeof decoded === "string" || !decoded.jti || !decoded.sub) return null;
+    payload = decoded;
+  } catch {
+    return null;
+  }
+  await ensureSchema();
+  const row = await pool!.query<{ id: string; email: string }>(
+    `SELECT u.id,u.email FROM abyss_api_tokens t JOIN abyss_users u ON u.id=t.user_id WHERE t.jti=$1 AND t.user_id=$2 AND t.revoked_at IS NULL`,
+    [payload.jti, payload.sub],
+  );
+  return row.rows[0] || null;
+}
+
 export async function currentUser(req: Request): Promise<{ id: string; email: string } | null> {
   await ensureSchema();
   const token = req.header("x-abyss-session") || req.cookies?.abyss_session;
-  if (!token) return null;
-  const result = await pool!.query<{ id: string; email: string }>(`SELECT u.id,u.email FROM abyss_sessions s JOIN abyss_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`, [hash(token)]);
-  return result.rows[0] || null;
+  if (token) {
+    const result = await pool!.query<{ id: string; email: string }>(`SELECT u.id,u.email FROM abyss_sessions s JOIN abyss_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()`, [hash(token)]);
+    if (result.rows[0]) return result.rows[0];
+  }
+  return userFromApiToken(req.header("authorization"));
 }
 
 export async function getProfile(userId: string): Promise<{ id: string; email: string; displayName: string | null } | null> {

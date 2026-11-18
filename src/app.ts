@@ -4,6 +4,7 @@ import cookieParser from "cookie-parser";
 import pinoHttp from "pino-http";
 import fs from "fs";
 import path from "path";
+import { createPublicKey } from "crypto";
 import { fileURLToPath } from "url";
 import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
@@ -72,6 +73,23 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stri
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "5mb" }));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
+// The API-token public key, published where any client (ours or a third party verifying one of
+// our tokens independently) expects to find it. Publishing the PUBLIC key is the point of RS256;
+// the private key that signs tokens is never reachable from any route.
+app.get("/.well-known/jwks.json", (_req, res) => {
+  const publicKeyPem = process.env.API_TOKEN_PUBLIC_KEY;
+  if (!publicKeyPem) {
+    res.status(503).json({ keys: [] });
+    return;
+  }
+  try {
+    const jwk = createPublicKey(publicKeyPem).export({ format: "jwk" }) as Record<string, string>;
+    res.json({ keys: [{ ...jwk, use: "sig", alg: "RS256", kid: process.env.API_TOKEN_KID || "default" }] });
+  } catch {
+    res.status(503).json({ keys: [] });
+  }
+});
+
 app.use("/api", authRouter);
 
 // Agentic access (x402): gates only MACHINE_ROUTE_PATH when X402_ENABLED=true.

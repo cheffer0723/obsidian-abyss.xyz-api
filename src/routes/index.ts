@@ -10,6 +10,7 @@ import adminRouter from "./admin.js";
 import feedbackRouter from "./feedback.js";
 import profileRouter from "./profile.js";
 import harnessRunsRouter from "./harness-runs.js";
+import apiTokensRouter from "./api-tokens.js";
 
 const router = Router();
 
@@ -24,5 +25,6 @@ router.use(adminRouter);
 router.use(feedbackRouter);
 router.use(profileRouter);
 router.use(harnessRunsRouter);
+router.use(apiTokensRouter);
 
 export default router;
