@@ -9,6 +9,7 @@ import testingHarnessRouter from "./testing-harness.js";
 import adminRouter from "./admin.js";
 import feedbackRouter from "./feedback.js";
 import profileRouter from "./profile.js";
+import harnessRunsRouter from "./harness-runs.js";
 
 const router = Router();
 
@@ -22,5 +23,6 @@ router.use(testingHarnessRouter);
 router.use(adminRouter);
 router.use(feedbackRouter);
 router.use(profileRouter);
+router.use(harnessRunsRouter);
 
 export default router;
