@@ -10,6 +10,7 @@ import { logger } from "./lib/logger.js";
 import { createX402Middleware, MACHINE_ROUTE_PATH } from "./lib/x402.js";
 import { stripeWebhookHandler } from "./lib/billing.js";
 import authRouter from "./routes/auth.js";
+import { allowedOrigins } from "./lib/origins.js";
 
 const app: Express = express();
 const createPinoHttp = pinoHttp as unknown as (options: any) => express.RequestHandler;
@@ -34,9 +35,27 @@ app.use(
   }),
 );
 app.disable("x-powered-by");
-const allowedOrigins = new Set(["https://obsidian-abyss.xyz", "https://www.obsidian-abyss.xyz", "https://obsidianabyss.com", "https://www.obsidianabyss.com", ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)]);
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)), credentials: true }));
 app.use(cookieParser());
+// The server's OWN check, independent of the cors() setting above (which only controls whether
+// a browser is allowed to READ the response -- it does not stop the server from PROCESSING a
+// request). Browsers always send Origin on a cross-site state-changing request; a same-origin
+// request from our own frontend, or a non-browser caller (curl, a server-to-server webhook,
+// this very test), sends no Origin at all. So: no Origin header -> allow (not the CSRF threat
+// model); an Origin header present and not one of ours -> refuse. Applies to every state-
+// changing method so every future route inherits it automatically.
+app.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    next();
+    return;
+  }
+  const origin = req.headers.origin;
+  if (!origin || allowedOrigins.has(origin)) {
+    next();
+    return;
+  }
+  res.status(403).json({ ok: false, error: "That request came from somewhere else, so we ignored it." });
+});
 // Stripe requires the untouched raw request body for signed webhook verification.
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "5mb" }));
