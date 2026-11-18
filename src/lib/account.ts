@@ -74,6 +74,23 @@ async function ensureSchema(): Promise<void> {
       revoked_at timestamptz
     );
     CREATE INDEX IF NOT EXISTS abyss_api_tokens_user_id_idx ON abyss_api_tokens (user_id);
+    CREATE TABLE IF NOT EXISTS abyss_oauth_clients (
+      client_id uuid PRIMARY KEY,
+      client_secret_hash text NOT NULL,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      redirect_uris jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS abyss_oauth_codes (
+      code_hash text PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      client_id uuid NOT NULL REFERENCES abyss_oauth_clients(client_id) ON DELETE CASCADE,
+      redirect_uri text NOT NULL,
+      expires_at timestamptz NOT NULL,
+      used_at timestamptz
+    );
+    CREATE INDEX IF NOT EXISTS abyss_oauth_clients_user_id_idx ON abyss_oauth_clients (user_id);
     CREATE INDEX IF NOT EXISTS abyss_harness_runs_user_id_idx ON abyss_harness_runs (user_id);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
@@ -351,6 +368,70 @@ async function userFromApiToken(authorizationHeader: string | undefined): Promis
     [payload.jti, payload.sub],
   );
   return row.rows[0] || null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Connect your account" -- a standard OAuth2 authorization-code flow so a third-party tool a
+// user trusts can access their account without ever seeing their password. Any signed-in user
+// can register their own client (the common "create an app" pattern in a developer-settings
+// page); there is no owner-only registration step.
+//
+// The security property this exists to prove: redirect_uri is matched EXACTLY against the
+// list the client registered, every time, both when issuing a code and when exchanging it.
+// No prefix match, no "starts with", no ignoring a query string or fragment the attacker
+// appended -- a redirect_uri that is not byte-for-byte one of the registered ones is refused.
+export async function registerOAuthClient(userId: string, name: string, redirectUris: string[]): Promise<{ clientId: string; clientSecret: string }> {
+  await ensureSchema();
+  const clientId = crypto.randomUUID();
+  const clientSecret = randomToken();
+  await pool!.query(
+    `INSERT INTO abyss_oauth_clients (client_id,client_secret_hash,user_id,name,redirect_uris) VALUES ($1,$2,$3,$4,$5)`,
+    [clientId, hash(clientSecret), userId, name, JSON.stringify(redirectUris)],
+  );
+  return { clientId, clientSecret };
+}
+
+type OAuthClientRow = { client_id: string; client_secret_hash: string; redirect_uris: string[] };
+
+async function findOAuthClient(clientId: string): Promise<OAuthClientRow | null> {
+  await ensureSchema();
+  const r = await pool!.query<OAuthClientRow>(`SELECT client_id,client_secret_hash,redirect_uris FROM abyss_oauth_clients WHERE client_id=$1`, [clientId]);
+  return r.rows[0] || null;
+}
+
+export type AuthorizeResult = { ok: true; code: string } | { ok: false; reason: "unknown_client" | "redirect_uri_mismatch" };
+
+export async function createAuthorizationCode(userId: string, clientId: string, redirectUri: string): Promise<AuthorizeResult> {
+  const client = await findOAuthClient(clientId);
+  if (!client) return { ok: false, reason: "unknown_client" };
+  // Exact string match only -- the one check this whole feature exists to get right.
+  if (!client.redirect_uris.includes(redirectUri)) return { ok: false, reason: "redirect_uri_mismatch" };
+  const code = randomToken();
+  const expiresAt = new Date(Date.now() + 60 * 1000); // 60s, standard for an auth code
+  await pool!.query(
+    `INSERT INTO abyss_oauth_codes (code_hash,user_id,client_id,redirect_uri,expires_at) VALUES ($1,$2,$3,$4,$5)`,
+    [hash(code), userId, clientId, redirectUri, expiresAt],
+  );
+  return { ok: true, code };
+}
+
+export type TokenExchangeResult = { ok: true; accessToken: string; expiresIn: number } | { ok: false; reason: "invalid_client" | "invalid_grant" };
+
+export async function exchangeAuthorizationCode(code: string, clientId: string, clientSecret: string, redirectUri: string): Promise<TokenExchangeResult> {
+  const client = await findOAuthClient(clientId);
+  if (!client || !timingSafeEqualHex(hash(clientSecret), client.client_secret_hash)) return { ok: false, reason: "invalid_client" };
+  await ensureSchema();
+  const row = await pool!.query<{ user_id: string; client_id: string; redirect_uri: string; expires_at: Date; used_at: Date | null }>(
+    `UPDATE abyss_oauth_codes SET used_at=now() WHERE code_hash=$1 AND client_id=$2 AND used_at IS NULL AND expires_at>now() RETURNING user_id,client_id,redirect_uri`,
+    [hash(code), clientId],
+  );
+  const matched = row.rows[0];
+  // redirect_uri must match the one the code was ISSUED for, not just any of the client's
+  // registered ones -- otherwise a code meant for one redirect could be redeemed against another.
+  if (!matched || matched.redirect_uri !== redirectUri) return { ok: false, reason: "invalid_grant" };
+  const created = await createApiToken(matched.user_id, `oauth:${clientId}`);
+  const expiresIn = Math.round((new Date(created.expiresAt).getTime() - Date.now()) / 1000);
+  return { ok: true, accessToken: created.token, expiresIn };
 }
 
 export async function currentUser(req: Request): Promise<{ id: string; email: string } | null> {

@@ -11,6 +11,7 @@ import feedbackRouter from "./feedback.js";
 import profileRouter from "./profile.js";
 import harnessRunsRouter from "./harness-runs.js";
 import apiTokensRouter from "./api-tokens.js";
+import oauthRouter from "./oauth.js";
 
 const router = Router();
 
@@ -26,5 +27,6 @@ router.use(feedbackRouter);
 router.use(profileRouter);
 router.use(harnessRunsRouter);
 router.use(apiTokensRouter);
+router.use(oauthRouter);
 
 export default router;
