@@ -49,6 +49,13 @@ async function ensureSchema(): Promise<void> {
       approved_at timestamptz,
       claimed_at timestamptz
     );
+    CREATE TABLE IF NOT EXISTS abyss_harness_runs (
+      id uuid PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS abyss_harness_runs_user_id_idx ON abyss_harness_runs (user_id);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_occurred_at_idx ON abyss_metric_events (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_metric_events_type_outcome_idx ON abyss_metric_events (event_type, outcome, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS abyss_beta_feedback_created_at_idx ON abyss_beta_feedback (created_at DESC);
@@ -223,6 +230,66 @@ export async function setDisplayName(userId: string, displayName: string): Promi
   );
   const row = result.rows[0];
   return { id: row.id, email: row.email, displayName: row.display_name };
+}
+
+export type HarnessRun = { id: string; userId: string; name: string; createdAt: string };
+
+// A real feature: a signed-in account can save a named backtest/analysis run and come back to
+// it later. Every read and write below checks ownership itself -- the row's own user_id, never
+// a value the caller supplies -- so there is one place this could go wrong, not one per route.
+export async function createHarnessRun(userId: string, name: string): Promise<HarnessRun> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; user_id: string; name: string; created_at: string }>(
+    `INSERT INTO abyss_harness_runs (id, user_id, name) VALUES ($1,$2,$3) RETURNING id, user_id, name, created_at`,
+    [crypto.randomUUID(), userId, name],
+  );
+  const row = result.rows[0];
+  return { id: row.id, userId: row.user_id, name: row.name, createdAt: row.created_at };
+}
+
+// Returns the row regardless of owner -- callers check ownership themselves (see the routes),
+// the same way every other ownership check in this file works: read, then compare, never trust
+// the caller's claim of who they are reading.
+export async function getHarnessRun(id: string): Promise<HarnessRun | null> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; user_id: string; name: string; created_at: string }>(
+    `SELECT id, user_id, name, created_at FROM abyss_harness_runs WHERE id=$1`,
+    [id],
+  );
+  const row = result.rows[0];
+  return row ? { id: row.id, userId: row.user_id, name: row.name, createdAt: row.created_at } : null;
+}
+
+// For a batch read: every id asked for, whoever it belongs to. The route filters to the
+// caller's own rows afterward -- the same per-item check as a single read, just run once per
+// item instead of skipped because the items arrived together.
+export async function getHarnessRunsByIds(ids: string[]): Promise<HarnessRun[]> {
+  await ensureSchema();
+  if (!ids.length) return [];
+  const result = await pool!.query<{ id: string; user_id: string; name: string; created_at: string }>(
+    `SELECT id, user_id, name, created_at FROM abyss_harness_runs WHERE id = ANY($1::uuid[])`,
+    [ids],
+  );
+  return result.rows.map((row) => ({ id: row.id, userId: row.user_id, name: row.name, createdAt: row.created_at }));
+}
+
+export async function listHarnessRunsByUser(userId: string): Promise<HarnessRun[]> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; user_id: string; name: string; created_at: string }>(
+    `SELECT id, user_id, name, created_at FROM abyss_harness_runs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,
+    [userId],
+  );
+  return result.rows.map((row) => ({ id: row.id, userId: row.user_id, name: row.name, createdAt: row.created_at }));
+}
+
+export async function renameHarnessRun(id: string, name: string): Promise<HarnessRun | null> {
+  await ensureSchema();
+  const result = await pool!.query<{ id: string; user_id: string; name: string; created_at: string }>(
+    `UPDATE abyss_harness_runs SET name=$2 WHERE id=$1 RETURNING id, user_id, name, created_at`,
+    [id, name],
+  );
+  const row = result.rows[0];
+  return row ? { id: row.id, userId: row.user_id, name: row.name, createdAt: row.created_at } : null;
 }
 
 export async function logout(req: Request, res: Response): Promise<void> {
