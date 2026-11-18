@@ -619,6 +619,33 @@ export async function listBetaFeedback(limit = 50): Promise<BetaFeedbackRow[]> {
   }));
 }
 
+export async function getBetaFeedbackById(id: string): Promise<BetaFeedbackRow | null> {
+  await ensureSchema();
+  const result = await pool!.query<{
+    id: string;
+    created_at: Date;
+    category: BetaFeedbackCategory;
+    message: string;
+    contact_email: string | null;
+    page_path: string | null;
+    resolved: boolean;
+  }>(
+    `SELECT id, created_at, category, message, contact_email, page_path, resolved FROM abyss_beta_feedback WHERE id=$1`,
+    [id],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    createdAt: row.created_at.toISOString(),
+    category: row.category,
+    message: row.message,
+    contactEmail: row.contact_email,
+    pagePath: row.page_path,
+    resolved: row.resolved,
+  };
+}
+
 // Admin-only, by convention of every caller (see the route) -- this function itself does not
 // check who is calling, the same as every other write in this file; the ROUTE is what enforces
 // admin-only, same pattern as requireAdmin elsewhere.

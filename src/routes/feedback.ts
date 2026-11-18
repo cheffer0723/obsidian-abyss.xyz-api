@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { currentUser, databaseReady, listBetaFeedback, resolveBetaFeedback, submitBetaFeedback } from "../lib/account.js";
+import { currentUser, databaseReady, getBetaFeedbackById, listBetaFeedback, resolveBetaFeedback, submitBetaFeedback } from "../lib/account.js";
 import { requireAdmin } from "../lib/access.js";
 
 const router = Router();
@@ -73,6 +73,26 @@ router.get("/admin/feedback", requireAdmin, async (req, res, next) => {
     const limit = Number(req.query.limit || 50);
     res.json({ ok: true, feedback: await listBetaFeedback(Number.isFinite(limit) ? limit : 50) });
   } catch (error) {
+    next(error);
+  }
+});
+
+// A single item, by id -- the natural sibling of the write below, and a way to check one
+// item's state without reading the whole list.
+router.get("/admin/feedback/:id", requireAdmin, async (req, res, next) => {
+  try {
+    const id = uuidSchema.parse(req.params.id);
+    const row = await getBetaFeedbackById(id);
+    if (!row) {
+      res.status(404).json({ ok: false, error: "Not found." });
+      return;
+    }
+    res.json({ ok: true, feedback: row });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "That is not a valid feedback id." });
+      return;
+    }
     next(error);
   }
 });
