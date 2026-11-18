@@ -6,7 +6,10 @@ import {
   databaseReady,
   entitlementFor,
   isAdminEmail,
+  logout,
   requestMagicLink,
+  testLoginConfigured,
+  testPasswordLogin,
   verifyMagicLink,
 } from "../lib/account.js";
 
@@ -19,6 +22,10 @@ const emailSchema = z.object({
 const claimSchema = z.object({
   loginIntentId: z.string().uuid(),
   waiterSecret: z.string().min(20).max(200),
+});
+const testLoginSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: z.string().min(1).max(200),
 });
 
 function appUrl(): string {
@@ -82,6 +89,47 @@ router.post("/auth/claim", async (req, res, next) => {
       res.status(400).json({ ok: false, error: "Invalid sign-in claim." });
       return;
     }
+    next(e);
+  }
+});
+
+// Test-only password sign-in. See account.ts: off entirely unless TEST_LOGIN_EMAIL and
+// TEST_LOGIN_PASSWORD_HASH are both set, and only ever signs in that one exact address.
+router.post("/auth/test-login", async (req, res, next) => {
+  try {
+    if (!testLoginConfigured()) {
+      res.status(404).json({ ok: false, error: "Not found." });
+      return;
+    }
+    if (!databaseReady()) {
+      res.status(503).json({ ok: false, error: "Authentication is temporarily unavailable." });
+      return;
+    }
+    const { email, password } = testLoginSchema.parse(req.body);
+    const sourceIp = req.header("x-forwarded-for")?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+    const result = await testPasswordLogin(email, password, sourceIp, res);
+    if (result === "ok") { res.json({ ok: true }); return; }
+    if (result === "locked") { res.status(429).json({ ok: false, error: "Too many attempts. Try again later." }); return; }
+    res.status(401).json({ ok: false, error: "Invalid email or password." });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "Invalid sign-in." });
+      return;
+    }
+    next(e);
+  }
+});
+
+router.post("/auth/logout", async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    if (!user) {
+      res.status(401).json({ ok: false, error: "Sign-in is required." });
+      return;
+    }
+    await logout(req, res);
+    res.json({ ok: true });
+  } catch (e) {
     next(e);
   }
 });

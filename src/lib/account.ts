@@ -194,6 +194,74 @@ export async function currentUser(req: Request): Promise<{ id: string; email: st
   return result.rows[0] || null;
 }
 
+export async function logout(req: Request, res: Response): Promise<void> {
+  const token = req.header("x-abyss-session") || req.cookies?.abyss_session;
+  if (token && pool) {
+    await ensureSchema();
+    await pool.query(`DELETE FROM abyss_sessions WHERE token_hash=$1`, [hash(token)]);
+  }
+  res.clearCookie("abyss_session", { httpOnly: true, secure: true, sameSite: "none" });
+}
+
+// ---------------------------------------------------------------------------------------------
+// TEST-ONLY password sign-in. Exists purely so our own authorized security testing (ScamShade)
+// has a synchronous login to exercise brute-force/lockout, logout and session-fixation checks
+// against the real session system, without needing a real customer's inbox for every attempt.
+//
+// Off by default: both TEST_LOGIN_EMAIL and TEST_LOGIN_PASSWORD_HASH must be set, and it only
+// ever works for that ONE exact email — every other address is refused the same way an unknown
+// account is refused everywhere else in this file. The password is never stored in the repo or
+// in cleartext in the environment, only its SHA-256 hash; comparison is constant-time. A small
+// in-memory lockout (5 attempts per 15 minutes per source IP, then refused for 15 minutes) is
+// the same shape a real password login should have, so testing it proves something real.
+// Never wired into the public login page — API-only, and 404s entirely when unconfigured.
+const testLoginAttempts = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
+const TEST_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const TEST_LOGIN_MAX_ATTEMPTS = 5;
+
+export function testLoginConfigured(): boolean {
+  return Boolean(process.env.TEST_LOGIN_EMAIL && process.env.TEST_LOGIN_PASSWORD_HASH);
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "hex");
+  const bufB = Buffer.from(b, "hex");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured";
+
+export async function testPasswordLogin(emailInput: string, password: string, sourceIp: string, res: Response): Promise<TestLoginResult> {
+  if (!testLoginConfigured()) return "not-configured";
+  const now = Date.now();
+  const key = sourceIp || "unknown";
+  const entry = testLoginAttempts.get(key);
+  if (entry && entry.lockedUntil > now) return "locked";
+  if (entry && now - entry.firstAt > TEST_LOGIN_WINDOW_MS) testLoginAttempts.delete(key);
+
+  const email = normalizeEmail(emailInput);
+  const expectedEmail = normalizeEmail(process.env.TEST_LOGIN_EMAIL!);
+  const passwordHash = hash(password);
+  const expectedHash = process.env.TEST_LOGIN_PASSWORD_HASH!.toLowerCase();
+  const ok = email === expectedEmail && timingSafeEqualHex(passwordHash, expectedHash);
+
+  if (!ok) {
+    const current = testLoginAttempts.get(key) || { count: 0, firstAt: now, lockedUntil: 0 };
+    current.count += 1;
+    if (current.count === 1) current.firstAt = now;
+    if (current.count >= TEST_LOGIN_MAX_ATTEMPTS) current.lockedUntil = now + TEST_LOGIN_WINDOW_MS;
+    testLoginAttempts.set(key, current);
+    return "invalid";
+  }
+
+  testLoginAttempts.delete(key);
+  await ensureSchema();
+  const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
+  await createSession(user.rows[0].id, res);
+  return "ok";
+}
+
 export async function upsertEntitlement(stripeCustomerId: string, subscriptionId: string, status: string, periodEnd: number | null): Promise<void> {
   await ensureSchema();
   const user = await pool!.query<{ id: string }>(`SELECT id FROM abyss_users WHERE stripe_customer_id=$1`, [stripeCustomerId]);
