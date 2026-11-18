@@ -15,6 +15,7 @@ const router = Router();
 const nameSchema = z.object({ name: z.string().trim().min(1).max(200) });
 const idsQuerySchema = z.object({ ids: z.string().trim().min(1).max(2000).optional() });
 const uuidSchema = z.string().uuid();
+const batchBodySchema = z.object({ ids: z.array(uuidSchema).min(1).max(20) });
 
 function asRun(run: { id: string; name: string; createdAt: string }) {
   return { id: run.id, name: run.name, createdAt: run.createdAt };
@@ -37,6 +38,34 @@ router.post("/harness/runs", async (req, res, next) => {
   } catch (error) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ ok: false, error: "Please enter a name between 1 and 200 characters." });
+      return;
+    }
+    next(error);
+  }
+});
+
+// The conventional batch shape: a POST body carrying the ids, for a longer list than fits
+// comfortably in a query string. Same ownership filter as every other read here -- every row
+// fetched is checked against the caller AFTER fetching, not trusted because it arrived in a
+// batch.
+router.post("/harness/runs/batch", async (req, res, next) => {
+  try {
+    if (!databaseReady()) {
+      res.status(503).json({ ok: false, error: "Saved runs are temporarily unavailable." });
+      return;
+    }
+    const user = await currentUser(req);
+    if (!user) {
+      res.status(401).json({ ok: false, error: "Sign-in is required." });
+      return;
+    }
+    const { ids } = batchBodySchema.parse(req.body);
+    const rows = await getHarnessRunsByIds(ids);
+    const mine = rows.filter((r) => r.userId === user.id).map(asRun);
+    res.json({ ok: true, runs: mine });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ ok: false, error: "Send 1 to 20 valid run ids." });
       return;
     }
     next(error);
