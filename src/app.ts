@@ -35,6 +35,17 @@ app.use(
   }),
 );
 app.disable("x-powered-by");
+// This server only ever answers JSON (no HTML of its own to render), so a locked-down CSP
+// costs nothing and a browser that somehow renders a response here runs no script or style.
+// Found missing by ScamShade's own security-posture and transport checks, 2026-11-18.
+app.use((_req, res, next) => {
+  res.setHeader("content-security-policy", "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader("strict-transport-security", "max-age=63072000; includeSubDomains; preload");
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("referrer-policy", "no-referrer");
+  next();
+});
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)), credentials: true }));
 app.use(cookieParser());
 // The server's OWN check, independent of the cors() setting above (which only controls whether
