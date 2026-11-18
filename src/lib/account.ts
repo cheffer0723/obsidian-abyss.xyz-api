@@ -50,6 +50,14 @@ async function ensureSchema(): Promise<void> {
       approved_at timestamptz,
       claimed_at timestamptz
     );
+    CREATE TABLE IF NOT EXISTS abyss_email_change_requests (
+      token_hash text PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
+      new_email text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      used_at timestamptz
+    );
     CREATE TABLE IF NOT EXISTS abyss_harness_runs (
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES abyss_users(id) ON DELETE CASCADE,
@@ -137,6 +145,68 @@ export async function requestMagicLink(
     logger.warn({ emailDomain: email.split("@")[1], error: error instanceof Error ? error.name : "unknown" }, "Magic link delivery failed");
   }
   return { loginIntentId, waiterSecret };
+}
+
+// Changing the login email is one of the most sensitive things a signed-in session can do --
+// combined with a password reset (or here, a magic link) it is a full account takeover. So a
+// session alone is never enough: this only SENDS a confirmation link to the NEW address. The
+// account's actual email does not change until that link is opened -- proving the requester
+// controls the new address, not just that they held a cookie.
+export type EmailChangeResult = { ok: true } | { ok: false; reason: "taken" };
+
+export async function requestEmailChange(userId: string, newEmailInput: string): Promise<EmailChangeResult> {
+  await ensureSchema();
+  const newEmail = normalizeEmail(newEmailInput);
+  const taken = await pool!.query(`SELECT id FROM abyss_users WHERE email=$1 AND id<>$2`, [newEmail, userId]);
+  if (taken.rowCount) return { ok: false, reason: "taken" };
+
+  const token = randomToken();
+  const tokenHash = hash(token);
+  await pool!.query(
+    `INSERT INTO abyss_email_change_requests (token_hash, user_id, new_email, expires_at) VALUES ($1,$2,$3,now()+interval '20 minutes')`,
+    [tokenHash, userId, newEmail],
+  );
+  const apiUrl = (process.env.AUTH_API_URL || "https://webapp-backend-production-7f0f.up.railway.app/api").replace(/\/$/, "");
+  const link = `${apiUrl}/account/email/confirm?token=${encodeURIComponent(token)}`;
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    logger.warn({ emailDomain: newEmail.split("@")[1] }, "Email-change confirmation not sent: SMTP is not configured");
+    return { ok: true };
+  }
+  const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === "true", auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
+  try {
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM || process.env.SMTP_USER,
+      to: newEmail,
+      subject: "Confirm your new Obsidian Abyss email",
+      text: [
+        `Confirm this address for your account: ${link}`,
+        "",
+        "If you did not ask to change your sign-in email, ignore this -- nothing changes until this link is opened.",
+        "This link expires in 20 minutes and can be used once.",
+      ].join("\n"),
+    });
+  } catch (error) {
+    logger.warn({ emailDomain: newEmail.split("@")[1], error: error instanceof Error ? error.name : "unknown" }, "Email-change confirmation delivery failed");
+  }
+  return { ok: true };
+}
+
+export async function confirmEmailChange(token: string): Promise<boolean> {
+  await ensureSchema();
+  const claimed = await pool!.query<{ user_id: string; new_email: string }>(
+    `UPDATE abyss_email_change_requests SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() RETURNING user_id, new_email`,
+    [hash(token)],
+  );
+  if (!claimed.rowCount) return false;
+  const { user_id: userId, new_email: newEmail } = claimed.rows[0];
+  try {
+    await pool!.query(`UPDATE abyss_users SET email=$1 WHERE id=$2`, [newEmail, userId]);
+  } catch {
+    // Someone else claimed that address between the request and this confirmation (the UNIQUE
+    // constraint caught it). The token is already spent; nothing else to do.
+    return false;
+  }
+  return true;
 }
 
 export async function verifyMagicLink(token: string, res: Response): Promise<boolean> {
