@@ -62,25 +62,29 @@ export function getX402Status() {
 function routeConfig() {
   const c = cfg();
   if (!c.publicApiUrl || !c.receivingAddress || !c.network || !c.amount) return null;
-  return {
-    [`GET ${MACHINE_ROUTE_PATH}`]: {
-      accepts: {
-        scheme: "exact",
-        price: c.amount,
-        network: c.network,
-        payTo: c.receivingAddress,
-        maxTimeoutSeconds: 120,
-        extra: { surface: "agentic", route: "backtesting" },
-      },
-      resource: `${c.publicApiUrl}${MACHINE_ROUTE_PATH}`,
-      description: "Paid agent access to the regime + backtesting research payload",
-      mimeType: "application/json",
-      serviceName: "Obsidian Abyss",
-      tags: ["agent", "backtesting", "x402"],
-      extensions: BUILDER_CODE_PATTERN.test(c.builderCode)
-        ? { ...declareBuilderCodeExtension(c.builderCode) }
-        : undefined,
+  const entryFor = (resourcePath: string) => ({
+    accepts: {
+      scheme: "exact",
+      price: c.amount,
+      network: c.network,
+      payTo: c.receivingAddress,
+      maxTimeoutSeconds: 120,
+      extra: { surface: "agentic", route: "backtesting" },
     },
+    resource: `${c.publicApiUrl}${resourcePath}`,
+    description: "Paid agent access to the regime + backtesting research payload",
+    mimeType: "application/json",
+    serviceName: "Obsidian Abyss",
+    tags: ["agent", "backtesting", "x402"],
+    extensions: BUILDER_CODE_PATTERN.test(c.builderCode)
+      ? { ...declareBuilderCodeExtension(c.builderCode) }
+      : undefined,
+  });
+  // /api/v1 is a real alias for the current /api paths (see app.ts) -- this route must be
+  // gated the exact same way there, or the v1 prefix would quietly bypass the paywall.
+  return {
+    [`GET ${MACHINE_ROUTE_PATH}`]: entryFor(MACHINE_ROUTE_PATH),
+    [`GET /api/v1${MACHINE_ROUTE_PATH.slice(4)}`]: entryFor(`/api/v1${MACHINE_ROUTE_PATH.slice(4)}`),
   };
 }
 
