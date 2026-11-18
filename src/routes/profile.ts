@@ -13,7 +13,7 @@ const router = Router();
 // uses: a role/plan/admin field sent alongside displayName is never read, by construction —
 // see setDisplayName in account.ts.
 const updateSchema = z.object({ displayName: z.string().trim().min(1).max(80) });
-const emailChangeSchema = z.object({ newEmail: z.string().trim().email().max(320) });
+const emailChangeSchema = z.object({ email: z.string().trim().email().max(320) });
 
 router.get("/account/profile", async (req, res, next) => {
   try {
@@ -71,8 +71,8 @@ router.post("/account/email/change", async (req, res, next) => {
       res.status(401).json({ ok: false, error: "Sign-in is required." });
       return;
     }
-    const { newEmail } = emailChangeSchema.parse(req.body);
-    const result = await requestEmailChange(user.id, newEmail);
+    const { email } = emailChangeSchema.parse(req.body);
+    const result = await requestEmailChange(user.id, email);
     if (!result.ok && result.reason === "taken") {
       res.status(409).json({ ok: false, error: "That email is already in use." });
       return;
