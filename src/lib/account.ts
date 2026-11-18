@@ -211,16 +211,25 @@ export async function logout(req: Request, res: Response): Promise<void> {
 // Off by default: both TEST_LOGIN_EMAIL and TEST_LOGIN_PASSWORD_HASH must be set, and it only
 // ever works for that ONE exact email — every other address is refused the same way an unknown
 // account is refused everywhere else in this file. The password is never stored in the repo or
-// in cleartext in the environment, only its SHA-256 hash; comparison is constant-time. A small
-// in-memory lockout (5 attempts per 15 minutes per source IP, then refused for 15 minutes) is
-// the same shape a real password login should have, so testing it proves something real.
+// in cleartext in the environment, only its SHA-256 hash; comparison is constant-time.
+//
+// LOCKOUT IS PER ACCOUNT, NOT PER SOURCE ADDRESS. (An earlier version counted attempts per the
+// first X-Forwarded-For value, which the caller chooses: a guesser could claim a new address on
+// every try and never be locked. Reproduced 2026-11-18: 12 wrong tries, each from a different
+// claimed address, none locked.) There is exactly one account here, so all failed attempts count
+// toward one limit no matter who they claim to be: 5 failures inside 15 minutes lock the account
+// for 15 minutes, and during the lock even the CORRECT password is refused. That caps online
+// guessing at 5 tries per 15 minutes in total. The trade-off is deliberate and acceptable for a
+// test-only door: anyone who knows the test email can lock the test account out for a while.
+// The count lives in memory, so it also resets when the server restarts. Even so, the password
+// must be long and random (24+ characters): the hash is a fast, unsalted SHA-256.
 // Never wired into the public login page — API-only, and 404s entirely when unconfigured.
-const testLoginAttempts = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
+const testLogin = { failures: 0, firstFailureAt: 0, lockedUntil: 0 };
 const TEST_LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const TEST_LOGIN_MAX_ATTEMPTS = 5;
+const TEST_LOGIN_MAX_FAILURES = 5;
 
 export function testLoginConfigured(): boolean {
-  return Boolean(process.env.TEST_LOGIN_EMAIL && process.env.TEST_LOGIN_PASSWORD_HASH);
+  return Boolean(process.env.TEST_LOGIN_EMAIL?.trim() && process.env.TEST_LOGIN_PASSWORD_HASH?.trim());
 }
 
 function timingSafeEqualHex(a: string, b: string): boolean {
@@ -232,30 +241,28 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 
 export type TestLoginResult = "ok" | "invalid" | "locked" | "not-configured";
 
-export async function testPasswordLogin(emailInput: string, password: string, sourceIp: string, res: Response): Promise<TestLoginResult> {
+export async function testPasswordLogin(emailInput: string, password: string, res: Response): Promise<TestLoginResult> {
   if (!testLoginConfigured()) return "not-configured";
   const now = Date.now();
-  const key = sourceIp || "unknown";
-  const entry = testLoginAttempts.get(key);
-  if (entry && entry.lockedUntil > now) return "locked";
-  if (entry && now - entry.firstAt > TEST_LOGIN_WINDOW_MS) testLoginAttempts.delete(key);
+  if (testLogin.lockedUntil > now) return "locked";
+  if (testLogin.failures > 0 && now - testLogin.firstFailureAt > TEST_LOGIN_WINDOW_MS) {
+    testLogin.failures = 0; testLogin.firstFailureAt = 0; testLogin.lockedUntil = 0;   // the window has passed: start fresh
+  }
 
   const email = normalizeEmail(emailInput);
   const expectedEmail = normalizeEmail(process.env.TEST_LOGIN_EMAIL!);
   const passwordHash = hash(password);
-  const expectedHash = process.env.TEST_LOGIN_PASSWORD_HASH!.toLowerCase();
+  const expectedHash = process.env.TEST_LOGIN_PASSWORD_HASH!.trim().toLowerCase();
   const ok = email === expectedEmail && timingSafeEqualHex(passwordHash, expectedHash);
 
   if (!ok) {
-    const current = testLoginAttempts.get(key) || { count: 0, firstAt: now, lockedUntil: 0 };
-    current.count += 1;
-    if (current.count === 1) current.firstAt = now;
-    if (current.count >= TEST_LOGIN_MAX_ATTEMPTS) current.lockedUntil = now + TEST_LOGIN_WINDOW_MS;
-    testLoginAttempts.set(key, current);
+    if (testLogin.failures === 0) testLogin.firstFailureAt = now;
+    testLogin.failures += 1;
+    if (testLogin.failures >= TEST_LOGIN_MAX_FAILURES) testLogin.lockedUntil = now + TEST_LOGIN_WINDOW_MS;
     return "invalid";
   }
 
-  testLoginAttempts.delete(key);
+  testLogin.failures = 0; testLogin.firstFailureAt = 0; testLogin.lockedUntil = 0;
   await ensureSchema();
   const user = await pool!.query<{ id: string }>(`INSERT INTO abyss_users (id,email) VALUES ($1,$2) ON CONFLICT (email) DO UPDATE SET email=EXCLUDED.email RETURNING id`, [crypto.randomUUID(), email]);
   await createSession(user.rows[0].id, res);

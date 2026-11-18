@@ -94,7 +94,8 @@ router.post("/auth/claim", async (req, res, next) => {
 });
 
 // Test-only password sign-in. See account.ts: off entirely unless TEST_LOGIN_EMAIL and
-// TEST_LOGIN_PASSWORD_HASH are both set, and only ever signs in that one exact address.
+// TEST_LOGIN_PASSWORD_HASH are both set, and only ever signs in that one exact address. The lockout is per
+// account (5 failures from anyone lock it for 15 minutes), not per claimed source address.
 router.post("/auth/test-login", async (req, res, next) => {
   try {
     if (!testLoginConfigured()) {
@@ -106,8 +107,7 @@ router.post("/auth/test-login", async (req, res, next) => {
       return;
     }
     const { email, password } = testLoginSchema.parse(req.body);
-    const sourceIp = req.header("x-forwarded-for")?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
-    const result = await testPasswordLogin(email, password, sourceIp, res);
+    const result = await testPasswordLogin(email, password, res);
     if (result === "ok") { res.json({ ok: true }); return; }
     if (result === "locked") { res.status(429).json({ ok: false, error: "Too many attempts. Try again later." }); return; }
     res.status(401).json({ ok: false, error: "Invalid email or password." });
