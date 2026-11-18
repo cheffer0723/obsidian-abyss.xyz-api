@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { createAuthorizationCode, currentUser, databaseReady, exchangeAuthorizationCode, registerOAuthClient } from "../lib/account.js";
+import { logActivity } from "../lib/activity-log.js";
 
 const router = Router();
 
@@ -24,6 +25,7 @@ router.post("/account/oauth-clients", async (req, res, next) => {
     }
     const { name, redirectUris } = registerSchema.parse(req.body);
     const client = await registerOAuthClient(user.id, name, redirectUris);
+    await logActivity(user.id, "oauth_client_registered", { name, clientId: client.clientId });
     // The secret is returned exactly once, the same as an API token -- there is nothing to
     // protect by storing it in a readable form.
     res.status(201).json({ ok: true, clientId: client.clientId, clientSecret: client.clientSecret });

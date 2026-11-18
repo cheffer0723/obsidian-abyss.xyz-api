@@ -10,6 +10,7 @@ import {
   renameHarnessRun,
 } from "../lib/account.js";
 import { renderReportPdf } from "../lib/reports.js";
+import { logActivity } from "../lib/activity-log.js";
 
 const router = Router();
 
@@ -157,6 +158,7 @@ router.get("/harness/runs/:id/report.pdf", async (req, res, next) => {
       return;
     }
     const pdf = await renderReportPdf({ id: run.id, name: run.name, createdAt: run.createdAt });
+    await logActivity(user.id, "report_exported", { runId: run.id });
     res.setHeader("content-type", "application/pdf");
     res.setHeader("content-disposition", `attachment; filename="backtest-report-${run.id}.pdf"`);
     res.send(pdf);
